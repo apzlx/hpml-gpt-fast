@@ -19,41 +19,64 @@ except:
 
 from model import Transformer
 
+
 ##### Quantization Primitives ######
-
+@torch.no_grad()
 def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
-    # assumes symmetric quantization
-    # assumes axis == 0
-    # assumes dense memory format
-    # TODO(future): relax ^ as needed
-
-    # default setup for affine quantization of activations
     eps = torch.finfo(torch.float32).eps
 
-    # get min and max
+    # Get min and max values per channel
     min_val, max_val = torch.aminmax(x, dim=1)
 
-    # calculate scales and zero_points based on min and max
-    # reference: https://fburl.com/code/srbiybme
+    # Compute scales
     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
-    device = min_val_neg.device
-
-    # reference: https://fburl.com/code/4wll53rk
     max_val_pos = torch.max(-min_val_neg, max_val_pos)
     scales = max_val_pos / (float(quant_max - quant_min) / 2)
-    # ensure scales is the same dtype as the original tensor
     scales = torch.clamp(scales, min=eps).to(x.dtype)
-    zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
+    zero_points = torch.zeros_like(min_val_neg, dtype=torch.int64, device=x.device)
 
-    # quantize based on qmin/qmax/scales/zp
-    # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
+    # Quantize the input
     x_div = x / scales.unsqueeze(-1)
     x_round = torch.round(x_div)
-    x_zp = x_round + zero_points.unsqueeze(-1)
-    quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
+    x_quantized = torch.clamp(x_round, quant_min, quant_max).to(target_dtype)
 
-    return quant, scales, zero_points
+    return x_quantized, scales, zero_points
+
+
+# def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
+#     # assumes symmetric quantization
+#     # assumes axis == 0
+#     # assumes dense memory format
+#     # TODO(future): relax ^ as needed
+
+#     # default setup for affine quantization of activations
+#     eps = torch.finfo(torch.float32).eps
+
+#     # get min and max
+#     min_val, max_val = torch.aminmax(x, dim=1)
+
+#     # calculate scales and zero_points based on min and max
+#     # reference: https://fburl.com/code/srbiybme
+#     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
+#     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
+#     device = min_val_neg.device
+
+#     # reference: https://fburl.com/code/4wll53rk
+#     max_val_pos = torch.max(-min_val_neg, max_val_pos)
+#     scales = max_val_pos / (float(quant_max - quant_min) / 2)
+#     # ensure scales is the same dtype as the original tensor
+#     scales = torch.clamp(scales, min=eps).to(x.dtype)
+#     zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
+
+#     # quantize based on qmin/qmax/scales/zp
+#     # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
+#     x_div = x / scales.unsqueeze(-1)
+#     x_round = torch.round(x_div)
+#     x_zp = x_round + zero_points.unsqueeze(-1)
+#     quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
+
+#     return quant, scales, zero_points
 
 def get_group_qparams(w, n_bit=4, groupsize=128):
     # needed for GPTQ with padding
@@ -307,7 +330,19 @@ class GPTQQuantHandler(QuantHandler):
     def convert_for_runtime(self) -> "nn.Module":
         pass
 
+
 ##### Weight-only int8 per-channel quantized code ######
+def replace_linear_weight_and_activation_int8_per_channel(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(
+                module,
+                name,
+                WeightAndActivationInt8Linear(child.in_features, child.out_features),
+            )
+        else:
+            replace_linear_weight_and_activation_int8_per_channel(child)
+
 
 def replace_linear_weight_only_int8_per_channel(module):
     for name, child in module.named_children():
@@ -315,6 +350,45 @@ def replace_linear_weight_only_int8_per_channel(module):
             setattr(module, name, WeightOnlyInt8Linear(child.in_features, child.out_features))
         else:
             replace_linear_weight_only_int8_per_channel(child)
+
+
+class WeightAndActivationInt8QuantHandler:
+    def __init__(self, mod):
+        self.mod = mod
+
+    @torch.no_grad()
+    def create_quantized_state_dict(self):
+        cur_state_dict = self.mod.state_dict()
+        for fqn, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear):
+                # Quantize weights
+                int8_weight, weight_scales, _ = dynamically_quantize_per_channel(
+                    mod.weight.float(), -128, 127, torch.int8
+                )
+                cur_state_dict[f"{fqn}.weight"] = int8_weight
+                cur_state_dict[f"{fqn}.weight_scales"] = weight_scales.to(
+                    mod.weight.dtype
+                )
+
+                # Quantize biases (per-channel scale)
+                if mod.bias is not None:
+                    bias_scale = (
+                        weight_scales * 1.0
+                    )  # Adjust for activation scales later if needed
+                    int8_bias = (
+                        torch.round(mod.bias.float() / bias_scale)
+                        .clamp(-128, 127)
+                        .to(torch.int8)
+                    )
+                    cur_state_dict[f"{fqn}.bias"] = int8_bias
+                    cur_state_dict[f"{fqn}.bias_scales"] = bias_scale.to(mod.bias.dtype)
+
+        return cur_state_dict
+
+    def convert_for_runtime(self):
+        replace_linear_weight_and_activation_int8_per_channel(self.mod)
+        return self.mod
+
 
 class WeightOnlyInt8QuantHandler:
     def __init__(self, mod):
@@ -334,6 +408,32 @@ class WeightOnlyInt8QuantHandler:
     def convert_for_runtime(self):
         replace_linear_weight_only_int8_per_channel(self.mod)
         return self.mod
+
+
+class WeightAndActivationInt8Linear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(WeightAndActivationInt8Linear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = None
+        self.bias = None
+        self.weight_scales = None
+        self.bias_scales = None
+
+    def forward(self, x):
+        # Quantize activations
+        int8_x, act_scales, _ = dynamically_quantize_per_channel(
+            x.float(), -128, 127, torch.int8
+        )
+
+        # Scale activations for dequantization
+        x_dequantized = int8_x.float() * act_scales.unsqueeze(-1)
+
+        # Perform matrix multiplication in float space (or keep it quantized for further optimization)
+        out = x_dequantized @ self.weight.T
+        if self.bias is not None:
+            out += self.bias * self.bias_scales
+        return out
 
 
 class WeightOnlyInt8Linear(torch.nn.Module):
