@@ -223,9 +223,9 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
-        from quantize import WeightOnlyInt8QuantHandler
+        from quantize import WeightAndActivationInt8QuantHandler
 
-        simple_quantizer = WeightOnlyInt8QuantHandler(model)
+        simple_quantizer = WeightAndActivationInt8QuantHandler(model)
 
         model = simple_quantizer.convert_for_runtime()
 
@@ -241,8 +241,6 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
 
-    print("Checkpoint Keys:", checkpoint.keys())
-    print("Model Keys:", model.state_dict().keys())
     model.load_state_dict(checkpoint, assign=True)
 
     if use_tp:
