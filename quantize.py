@@ -563,6 +563,43 @@ def symmetric_quantize_tensor(x, quant_min, quant_max, target_dtype):
 
     return x_clipped.to(target_dtype), scale, zero_point
 
+
+class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
+    def convert_for_runtime(self):
+        """Convert the model for runtime by replacing layers"""
+        replace_linear_weight_and_activation_int8(self.mod)
+        return self.mod
+
+    @torch.no_grad()
+    def create_quantized_state_dict(self):
+        # First get original state dict to preserve all non-Linear weights/biases
+        cur_state_dict = {}
+        checkpoint = self.mod.state_dict()
+
+        # Copy over all non-Linear layer parameters directly
+        for key, value in checkpoint.items():
+            # Check if this key corresponds to a Linear layer weight
+            is_linear_weight = any(
+                isinstance(mod, nn.Linear) and name + ".weight" == key
+                for name, mod in self.mod.named_modules()
+            )
+            if not is_linear_weight:
+                cur_state_dict[key] = value
+
+        # Now handle Linear layer weights
+        for name, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear):
+                weight_int8, scales, _ = dynamically_quantize_per_channel(
+                    mod.weight.float(), -128, 127, torch.int8
+                )
+
+                # Use original key names
+                cur_state_dict[f"{name}.weight"] = weight_int8
+                cur_state_dict[f"{name}.scales"] = scales
+
+        return cur_state_dict
+
+
 class WeightAndActivationInt8Linear(torch.nn.Module):
 
     def __init__(
@@ -578,19 +615,11 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Keep weight as a buffer (not Parameter) for dtype access
+        # Keep weight to match original model structure
         self.register_buffer(
-            "weight", torch.empty((out_features, in_features), **factory_kwargs)
+            "weight", torch.empty((out_features, in_features), dtype=torch.int8)
         )
-
-        # Quantization buffers
-        self.register_buffer(
-            "weight_int8", torch.empty((out_features, in_features), dtype=torch.int8)
-        )
-        self.register_buffer(
-            "weight_scales", torch.ones(out_features, dtype=torch.float32)
-        )
-        self.register_buffer("act_scales", torch.ones(1, dtype=torch.float32))
+        self.register_buffer("scales", torch.ones(out_features, dtype=torch.float32))
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
@@ -598,28 +627,13 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
-        # Everything else remains the same
-        x_int8, act_scale = self.quantize_input(x)
-        weight_dequant = self.weight_int8.float() * self.weight_scales.unsqueeze(1)
-        output = F.linear(x_int8.float(), weight_dequant, self.bias)
-        output_scale = act_scale * self.weight_scales
-        output = output * output_scale.unsqueeze(1)
-        return output
-
-    def quantize_input(self, x):
-        x_int8, act_scale, _ = symmetric_quantize_tensor(x, -128, 127, torch.int8)
-        if self.training:
-            self.act_scales = 0.9 * self.act_scales + 0.1 * act_scale
-        return x_int8, self.act_scales
-
+        weight_dequant = self.weight.float() * self.scales.unsqueeze(1)
+        return F.linear(x, weight_dequant, self.bias)
 
 def replace_linear_weight_and_activation_int8(module):
-    """
-    Recursively replace linear layers with weight and activation quantized version
-    """
+    """Recursively replace linear layers with quantized version"""
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
-            # Create new quantized layer
             new_layer = WeightAndActivationInt8Linear(
                 child.in_features,
                 child.out_features,
@@ -627,39 +641,10 @@ def replace_linear_weight_and_activation_int8(module):
                 device=child.weight.device,
                 dtype=child.weight.dtype,
             )
-
-            # Set the module
             setattr(module, name, new_layer)
         else:
             replace_linear_weight_and_activation_int8(child)
-
     return module
-
-class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
-
-    def convert_for_runtime(self):
-        self.mod = replace_linear_weight_and_activation_int8(self.mod)
-        return self.mod
-
-    @torch.no_grad()
-    def create_quantized_state_dict(self):
-        cur_state_dict = self.mod.state_dict()
-
-        for fqn, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                weight_int8, weight_scales, _ = dynamically_quantize_per_channel(
-                    mod.weight.float(), -128, 127, torch.int8
-                )
-
-                # Update state dict with quantized components
-                cur_state_dict[f"{fqn}.weight_int8"] = weight_int8
-                cur_state_dict[f"{fqn}.weight_scales"] = weight_scales
-                cur_state_dict[f"{fqn}.act_scales"] = torch.ones(1, dtype=torch.float32)
-
-                # Remove the original weight
-                cur_state_dict.pop(f"{fqn}.weight")
-
-        return cur_state_dict
 
 
 def quantize(
