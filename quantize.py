@@ -641,23 +641,31 @@ class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
 
     @torch.no_grad()
     def create_quantized_state_dict(self):
-        """Create quantized state dictionary"""
-        cur_state_dict = {}
+        # Start with the complete state dict to keep non-linear layer weights
+        cur_state_dict = self.mod.state_dict()
 
         for fqn, mod in self.mod.named_modules():
             if isinstance(mod, nn.Linear):
-                # Quantize the weights
-                int8_weight, weight_scales, _ = dynamically_quantize_per_channel(
-                    mod.weight.float(), -128, 127, torch.int8
+                # Create a new quantized layer
+                new_layer = WeightAndActivationInt8Linear(
+                    mod.in_features, mod.out_features, bias=mod.bias is not None
                 )
 
-                # Add to state dict
-                cur_state_dict[f"{fqn}.weight_int8"] = int8_weight
-                cur_state_dict[f"{fqn}.weight_scales"] = weight_scales
-                cur_state_dict[f"{fqn}.act_scales"] = torch.ones(1, dtype=torch.float32)
-
+                # Copy existing weights
+                new_layer.weight.data.copy_(mod.weight.data)
                 if mod.bias is not None:
-                    cur_state_dict[f"{fqn}.bias"] = mod.bias.data
+                    new_layer.bias.data.copy_(mod.bias.data)
+
+                # Quantize weights
+                new_layer.quantize_weight()
+
+                # Update state dict with quantized components
+                cur_state_dict[f"{fqn}.weight_int8"] = new_layer.weight_int8
+                cur_state_dict[f"{fqn}.weight_scales"] = new_layer.weight_scales
+                cur_state_dict[f"{fqn}.act_scales"] = new_layer.act_scales
+
+                # Remove the original weight (since we're replacing it)
+                cur_state_dict.pop(f"{fqn}.weight")
 
         return cur_state_dict
 
