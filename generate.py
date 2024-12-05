@@ -239,6 +239,9 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
+
+    print("Checkpoint Keys:", checkpoint.keys())
+    print("Model Keys:", model.state_dict().keys())
     model.load_state_dict(checkpoint, assign=True)
 
     if use_tp:
