@@ -417,24 +417,30 @@ class WeightAndActivationInt8Linear(nn.Module):
         super(WeightAndActivationInt8Linear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.int8))
-        self.weight_scales = nn.Parameter(torch.empty(out_features, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.int8))
-        self.bias_scales = nn.Parameter(torch.empty(out_features, dtype=torch.float32))
+
+        # Store quantized weights as regular tensors
+        self.weight = torch.empty(out_features, in_features, dtype=torch.int8)
+        self.weight_scales = nn.Parameter(
+            torch.empty(out_features, dtype=torch.float32), requires_grad=False
+        )
+
+        # Store bias similarly
+        self.bias = torch.empty(out_features, dtype=torch.int8)
+        self.bias_scales = nn.Parameter(
+            torch.empty(out_features, dtype=torch.float32), requires_grad=False
+        )
 
     def forward(self, x):
         # Quantize activations
-        int8_x, act_scales, _ = dynamically_quantize_per_channel(
-            x.float(), -128, 127, torch.int8
+        dequantized_weight = self.weight.float() * self.weight_scales.unsqueeze(-1)
+        dequantized_bias = (
+            self.bias.float() * self.bias_scales if self.bias is not None else None
         )
 
-        # Scale activations for dequantization
-        x_dequantized = int8_x.float() * act_scales.unsqueeze(-1)
-
-        # Perform matrix multiplication in float space (or keep it quantized for further optimization)
-        out = x_dequantized @ self.weight.T
-        if self.bias is not None:
-            out += self.bias * self.bias_scales
+        # Compute output
+        out = x @ dequantized_weight.T
+        if dequantized_bias is not None:
+            out += dequantized_bias
         return out
 
 
