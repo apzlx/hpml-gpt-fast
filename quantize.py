@@ -334,11 +334,13 @@ class GPTQQuantHandler(QuantHandler):
 def replace_linear_weight_and_activation_int8_per_channel(module):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
-            setattr(
-                module,
-                name,
-                WeightAndActivationInt8Linear(child.in_features, child.out_features),
-            )
+            quant_layer = WeightAndActivationInt8Linear(child.in_features, child.out_features)
+            quant_layer.weight.data = child.weight.data.int_repr()
+            quant_layer.weight_scales.data = child.weight_scales
+            if child.bias is not None:
+                quant_layer.bias.data = child.bias.data.int_repr()
+                quant_layer.bias_scales.data = child.bias_scales
+            setattr(module, name, quant_layer)
         else:
             replace_linear_weight_and_activation_int8_per_channel(child)
 
@@ -352,7 +354,7 @@ def replace_linear_weight_only_int8_per_channel(module):
 
 
 class WeightAndActivationInt8QuantHandler:
-    def __init__(self, mod):
+    def __init__(self, mod, in_features, out_features), :
         self.mod = mod
 
     @torch.no_grad()
@@ -414,10 +416,10 @@ class WeightAndActivationInt8Linear(nn.Module):
         super(WeightAndActivationInt8Linear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = None
-        self.bias = None
-        self.weight_scales = None
-        self.bias_scales = None
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.int8))
+        self.weight_scales = nn.Parameter(torch.empty(out_features, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.int8))
+        self.bias_scales = nn.Parameter(torch.empty(out_features, dtype=torch.float32))
 
     def forward(self, x):
         # Quantize activations
@@ -657,7 +659,8 @@ def quantize(
         print("Quantizing model weights for int8 weight-only symmetric per-channel quantization")
         quant_handler = WeightAndActivationInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-        print(quantized_state_dict.keys())
+        print("Quantized State Dict Keys:", quantized_state_dict.keys())
+        print("Model State Dict Keys:", model.state_dict().keys())
 
         dir_name = checkpoint_path.parent
         base_name = checkpoint_path.name
