@@ -331,7 +331,6 @@ class GPTQQuantHandler(QuantHandler):
         pass
 
 
-##### Weight-only int8 per-channel quantized code ######
 def replace_linear_weight_and_activation_int8_per_channel(module):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
@@ -658,7 +657,7 @@ def quantize(
 
     if mode == 'int8':
         print("Quantizing model weights for int8 weight-only symmetric per-channel quantization")
-        quant_handler = WeightOnlyInt8QuantHandler(model)
+        quant_handler = WeightAndActivationInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
 
         dir_name = checkpoint_path.parent
