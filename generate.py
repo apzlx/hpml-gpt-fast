@@ -223,9 +223,9 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
-        from quantize import WeightAndActivationInt8QuantHandler
+        from quantize import WeightOnlyInt8QuantHandler
 
-        simple_quantizer = WeightAndActivationInt8QuantHandler(model)
+        simple_quantizer = WeightOnlyInt8QuantHandler(model)
 
         model = simple_quantizer.convert_for_runtime()
 

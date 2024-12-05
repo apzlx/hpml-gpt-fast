@@ -19,64 +19,41 @@ except:
 
 from model import Transformer
 
-
 ##### Quantization Primitives ######
-@torch.no_grad()
+
 def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
+    # assumes symmetric quantization
+    # assumes axis == 0
+    # assumes dense memory format
+    # TODO(future): relax ^ as needed
+
+    # default setup for affine quantization of activations
     eps = torch.finfo(torch.float32).eps
 
-    # Get min and max values per channel
+    # get min and max
     min_val, max_val = torch.aminmax(x, dim=1)
 
-    # Compute scales
+    # calculate scales and zero_points based on min and max
+    # reference: https://fburl.com/code/srbiybme
     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
+    device = min_val_neg.device
+
+    # reference: https://fburl.com/code/4wll53rk
     max_val_pos = torch.max(-min_val_neg, max_val_pos)
     scales = max_val_pos / (float(quant_max - quant_min) / 2)
+    # ensure scales is the same dtype as the original tensor
     scales = torch.clamp(scales, min=eps).to(x.dtype)
-    zero_points = torch.zeros_like(min_val_neg, dtype=torch.int64, device=x.device)
+    zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
 
-    # Quantize the input
+    # quantize based on qmin/qmax/scales/zp
+    # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
     x_div = x / scales.unsqueeze(-1)
     x_round = torch.round(x_div)
-    x_quantized = torch.clamp(x_round, quant_min, quant_max).to(target_dtype)
+    x_zp = x_round + zero_points.unsqueeze(-1)
+    quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
 
-    return x_quantized, scales, zero_points
-
-
-# def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
-#     # assumes symmetric quantization
-#     # assumes axis == 0
-#     # assumes dense memory format
-#     # TODO(future): relax ^ as needed
-
-#     # default setup for affine quantization of activations
-#     eps = torch.finfo(torch.float32).eps
-
-#     # get min and max
-#     min_val, max_val = torch.aminmax(x, dim=1)
-
-#     # calculate scales and zero_points based on min and max
-#     # reference: https://fburl.com/code/srbiybme
-#     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
-#     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
-#     device = min_val_neg.device
-
-#     # reference: https://fburl.com/code/4wll53rk
-#     max_val_pos = torch.max(-min_val_neg, max_val_pos)
-#     scales = max_val_pos / (float(quant_max - quant_min) / 2)
-#     # ensure scales is the same dtype as the original tensor
-#     scales = torch.clamp(scales, min=eps).to(x.dtype)
-#     zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
-
-#     # quantize based on qmin/qmax/scales/zp
-#     # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
-#     x_div = x / scales.unsqueeze(-1)
-#     x_round = torch.round(x_div)
-#     x_zp = x_round + zero_points.unsqueeze(-1)
-#     quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
-
-#     return quant, scales, zero_points
+    return quant, scales, zero_points
 
 def get_group_qparams(w, n_bit=4, groupsize=128):
     # needed for GPTQ with padding
@@ -330,20 +307,7 @@ class GPTQQuantHandler(QuantHandler):
     def convert_for_runtime(self) -> "nn.Module":
         pass
 
-
-def replace_linear_weight_and_activation_int8_per_channel(module):
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            quant_layer = WeightAndActivationInt8Linear(child.in_features, child.out_features)
-            quant_layer.weight.data = child.weight.data.int_repr()
-            quant_layer.weight_scales.data = child.weight_scales
-            if child.bias is not None:
-                quant_layer.bias.data = child.bias.data.int_repr()
-                quant_layer.bias_scales.data = child.bias_scales
-            setattr(module, name, quant_layer)
-        else:
-            replace_linear_weight_and_activation_int8_per_channel(child)
-
+##### Weight-only int8 per-channel quantized code ######
 
 def replace_linear_weight_only_int8_per_channel(module):
     for name, child in module.named_children():
@@ -351,46 +315,6 @@ def replace_linear_weight_only_int8_per_channel(module):
             setattr(module, name, WeightOnlyInt8Linear(child.in_features, child.out_features))
         else:
             replace_linear_weight_only_int8_per_channel(child)
-
-
-class WeightAndActivationInt8QuantHandler:
-
-    def __init__(self, mod):
-        self.mod = mod
-
-    @torch.no_grad()
-    def create_quantized_state_dict(self):
-        cur_state_dict = self.mod.state_dict()
-        for fqn, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                # Quantize weights
-                int8_weight, weight_scales, _ = dynamically_quantize_per_channel(
-                    mod.weight.float(), -128, 127, torch.int8
-                )
-                cur_state_dict[f"{fqn}.weight"] = int8_weight
-                cur_state_dict[f"{fqn}.weight_scales"] = weight_scales.to(
-                    mod.weight.dtype
-                )
-
-                # Quantize biases (per-channel scale)
-                if mod.bias is not None:
-                    bias_scale = (
-                        weight_scales * 1.0
-                    )  # Adjust for activation scales later if needed
-                    int8_bias = (
-                        torch.round(mod.bias.float() / bias_scale)
-                        .clamp(-128, 127)
-                        .to(torch.int8)
-                    )
-                    cur_state_dict[f"{fqn}.bias"] = int8_bias
-                    cur_state_dict[f"{fqn}.bias_scales"] = bias_scale.to(mod.bias.dtype)
-
-        return cur_state_dict
-
-    def convert_for_runtime(self):
-        replace_linear_weight_and_activation_int8_per_channel(self.mod)
-        return self.mod
-
 
 class WeightOnlyInt8QuantHandler:
     def __init__(self, mod):
@@ -412,54 +336,46 @@ class WeightOnlyInt8QuantHandler:
         return self.mod
 
 
-class WeightAndActivationInt8Linear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(WeightAndActivationInt8Linear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # Store quantized weights as regular tensors
-        self.weight = torch.empty(out_features, in_features, dtype=torch.int8)
-        self.weight_scales = nn.Parameter(
-            torch.empty(out_features, dtype=torch.float32), requires_grad=False
-        )
-
-        # Store bias similarly
-        self.bias = torch.empty(out_features, dtype=torch.int8)
-        self.bias_scales = nn.Parameter(
-            torch.empty(out_features, dtype=torch.float32), requires_grad=False
-        )
-
-    def forward(self, x):
-        # Quantize activations
-        dequantized_weight = self.weight.float() * self.weight_scales.unsqueeze(-1)
-        dequantized_bias = (
-            self.bias.float() * self.bias_scales if self.bias is not None else None
-        )
-
-        # Compute output
-        out = x @ dequantized_weight.T
-        if dequantized_bias is not None:
-            out += dequantized_bias
-        return out
-
-
 class WeightOnlyInt8Linear(torch.nn.Module):
     __constants__ = ['in_features', 'out_features']
     in_features: int
     out_features: int
     weight: torch.Tensor
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+        groupsize: int = 128,
+        inner_k_tiles: int = 8,
+        quant_min: int = -128,
+        quant_max: int = 127,
+        target_dtype=torch.int8,
+    ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+        self.register_buffer(
+            "weight", torch.empty((out_features, in_features), dtype=torch.int8)
+        )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.target_dtype = target_dtype
+
+    def quantize_activations(self, x):
+        quant, scales, zero_points = dynamically_quantize_per_channel(
+            x, self.quant_min, self.quant_max, self.target_dtype
+        )
+        return quant.to(x.dtype) * scales.unsqueeze(-1)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = self.quantize_activations(input)
         return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
 
 ##### weight only int4 per channel groupwise quantized code ######
@@ -664,10 +580,8 @@ def quantize(
 
     if mode == 'int8':
         print("Quantizing model weights for int8 weight-only symmetric per-channel quantization")
-        quant_handler = WeightAndActivationInt8QuantHandler(model)
+        quant_handler = WeightOnlyInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-        print("Quantized State Dict Keys:", quantized_state_dict.keys())
-        print("Model State Dict Keys:", model.state_dict().keys())
 
         dir_name = checkpoint_path.parent
         base_name = checkpoint_path.name
@@ -729,4 +643,15 @@ if __name__ == '__main__':
     parser.add_argument('--label', type=str, default='_', help='label to add to output filename')
 
     args = parser.parse_args()
-    quantize(args.checkpoint_path, args.mode, args.groupsize, args.calibration_tasks, args.calibration_limit, args.calibration_seq_length, args.pad_calibration_inputs, args.percdamp, args.blocksize, args.label)
+    quantize(
+        args.checkpoint_path,
+        args.mode,
+        args.groupsize,
+        args.calibration_tasks,
+        args.calibration_limit,
+        args.calibration_seq_length,
+        args.pad_calibration_inputs,
+        args.percdamp,
+        args.blocksize,
+        args.label,
+    )
