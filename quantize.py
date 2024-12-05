@@ -354,7 +354,8 @@ def     replace_linear_weight_only_int8_per_channel(module):
 
 
 class WeightAndActivationInt8QuantHandler:
-    def __init__(self, mod, in_features, out_features), :
+
+    def __init__(self, mod, in_features, out_features):
         self.mod = mod
 
     @torch.no_grad()
