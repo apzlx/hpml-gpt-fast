@@ -578,8 +578,12 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Remove the original weight Parameter
-        # Just use buffers for quantized weights and scales
+        # Keep weight as a buffer (not Parameter) for dtype access
+        self.register_buffer(
+            "weight", torch.empty((out_features, in_features), **factory_kwargs)
+        )
+
+        # Quantization buffers
         self.register_buffer(
             "weight_int8", torch.empty((out_features, in_features), dtype=torch.int8)
         )
@@ -594,19 +598,12 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
-        # Quantize input
+        # Everything else remains the same
         x_int8, act_scale = self.quantize_input(x)
-
-        # Dequantize and scale weight
         weight_dequant = self.weight_int8.float() * self.weight_scales.unsqueeze(1)
-
-        # Perform quantized linear operation
         output = F.linear(x_int8.float(), weight_dequant, self.bias)
-
-        # Scale output based on input and weight scales
         output_scale = act_scale * self.weight_scales
         output = output * output_scale.unsqueeze(1)
-
         return output
 
     def quantize_input(self, x):
