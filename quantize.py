@@ -618,22 +618,27 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
-        # Need to handle x with shape (batch_size, seq_length, hidden_dim)
-        # Transpose to get hidden_dim as first dimension for per-channel quantization
-        x_transposed = x.transpose(0, -1)  # (hidden_dim, seq_length, batch_size)
+        # x shape is (batch_size, seq_len, hidden_dim)
+        orig_shape = x.shape
 
-        # Quantize each channel (each hidden dim feature)
+        # Reshape to 2D for per-channel quantization
+        # Combine batch and seq into one dimension
+        x_2d = x.reshape(-1, orig_shape[-1])  # (batch*seq, hidden_dim)
+
+        # Quantize using per-channel (transpose since dynamically_quantize_per_channel works on dim 1)
+        x_2d = x_2d.T  # (hidden_dim, batch*seq)
         x_int8, act_scale, _ = dynamically_quantize_per_channel(
-            x_transposed.reshape(self.in_features, -1), -128, 127, torch.int8
+            x_2d, -128, 127, torch.int8
         )
 
-        # Reshape and transpose back
-        x_int8 = x_int8.reshape(self.in_features, -1, x.size(0)).transpose(0, -1)
+        # Dequantize and reshape back
+        x_dequant = (
+            x_int8.float() * act_scale.unsqueeze(-1)
+        ).T  # Scale per channel and transpose back
+        x_dequant = x_dequant.reshape(orig_shape).to(x.dtype)
 
-        # Dequantize
-        x_dequant = (x_int8.float() * act_scale.unsqueeze(-1).unsqueeze(0)).to(x.dtype)
+        # Normal linear operation with quantized weights
         weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
-
         return F.linear(x_dequant, weight_dequant, self.bias)
 
 
