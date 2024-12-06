@@ -589,35 +589,21 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
 
     def forward(self, x):
         # x shape: (batch_size, seq_len, hidden_dim)
-        B, S, H = x.shape
+        orig_shape = x.shape
 
-        # Use block size of 128 for activation quantization
-        block_size = 128
-        num_blocks = H // block_size
+        # Reshape to 2D and transpose for per-channel quantization
+        x_2d = x.reshape(-1, orig_shape[-1]).T
 
-        # Reshape and process each block with dynamically_quantize_per_channel
-        x_blocked = x.view(B * S, num_blocks, block_size).transpose(
-            1, 2
-        )  # (B*S, block_size, num_blocks)
-        x_int8_list = []
-        scales_list = []
+        # Single quantize call for all channels
+        x_int8, act_scale, _ = dynamically_quantize_per_channel(
+            x_2d, -128, 127, torch.int8
+        )
 
-        for i in range(num_blocks):
-            block = x_blocked[:, :, i].T  # Shape for dynamically_quantize_per_channel
-            block_int8, scales, _ = dynamically_quantize_per_channel(
-                block, -128, 127, torch.int8
-            )
-            x_int8_list.append(block_int8.T)
-            scales_list.append(scales)
+        # Dequant and reshape back
+        x_dequant = (x_int8.T.float() * act_scale).reshape(orig_shape).to(x.dtype)
 
-        # Concatenate blocks
-        x_int8 = torch.cat(x_int8_list, dim=1).view(B, S, H)
-        scales = torch.cat(scales_list)
-
-        # Dequantize and compute
-        x_dequant = x_int8.float() * scales.view(1, 1, -1).to(x.dtype)
+        # Weight dequant and compute
         weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
-
         return F.linear(x_dequant, weight_dequant, self.bias)
 
 
