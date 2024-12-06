@@ -573,29 +573,17 @@ class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
     @torch.no_grad()
     def create_quantized_state_dict(self):
         # First get original state dict to preserve all non-Linear weights/biases
-        cur_state_dict = {}
-        checkpoint = self.mod.state_dict()
+        cur_state_dict = self.mod.state_dict()
 
-        # Copy over all non-Linear layer parameters directly
-        for key, value in checkpoint.items():
-            # Check if this key corresponds to a Linear layer weight
-            is_linear_weight = any(
-                isinstance(mod, nn.Linear) and name + ".weight" == key
-                for name, mod in self.mod.named_modules()
-            )
-            if not is_linear_weight:
-                cur_state_dict[key] = value
-
-            # Now handle Linear layer weights
-            for fqn, mod in self.mod.named_modules():
-                if isinstance(mod, torch.nn.Linear):
-                    weight_int8, weight_scales, _ = dynamically_quantize_per_channel(
-                        mod.weight.float(), -128, 127, torch.int8
-                    )
-
-                # Update state dict with quantized components
-                cur_state_dict[f"{fqn}.weight"] = weight_int8
-                cur_state_dict[f"{fqn}.scales"] = weight_scales
+        # Then quantize the linear layers while preserving everything else
+        for fqn, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear):
+                int8_weight, scales, _ = dynamically_quantize_per_channel(
+                    mod.weight.float(), -128, 127, torch.int8
+                )
+                # Update weights and add activation scale
+                cur_state_dict[f"{fqn}.weight"] = int8_weight
+                cur_state_dict[f"{fqn}.scales"] = scales
                 cur_state_dict[f"{fqn}.act_scale"] = torch.ones(1, dtype=torch.float32)
 
         return cur_state_dict
@@ -611,6 +599,7 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         device=None,
         dtype=None,
     ) -> None:
+
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.in_features = in_features
@@ -621,8 +610,6 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             "weight", torch.empty((out_features, in_features), dtype=torch.int8)
         )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.float32))
-
-        # Activation quantization buffer
         self.register_buffer("act_scale", torch.ones(1, dtype=torch.float32))
 
         if bias:
