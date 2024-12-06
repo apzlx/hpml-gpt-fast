@@ -615,36 +615,39 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Keep weight to match original model structure
+        # Keep weight buffer for model compatibility
         self.register_buffer(
             "weight", torch.empty((out_features, in_features), dtype=torch.int8)
         )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.float32))
+
+        # Activation quantization buffer
+        self.register_buffer("act_scale", torch.ones(1, dtype=torch.float32))
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x):
-        weight_dequant = self.weight.float() * self.scales.unsqueeze(1)
-        return F.linear(x, weight_dequant, self.bias)
+    def quantize_activation(self, x):
+        """Quantize input activation"""
+        x_int8, scale, _ = symmetric_quantize_tensor(x, -128, 127, torch.int8)
 
-def replace_linear_weight_and_activation_int8(module):
-    """Recursively replace linear layers with quantized version"""
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            new_layer = WeightAndActivationInt8Linear(
-                child.in_features,
-                child.out_features,
-                bias=child.bias is not None,
-                device=child.weight.device,
-                dtype=child.weight.dtype,
-            )
-            setattr(module, name, new_layer)
-        else:
-            replace_linear_weight_and_activation_int8(child)
-    return module
+        # Update activation scale with moving average during training
+        if self.training:
+            self.act_scale = 0.9 * self.act_scale + 0.1 * scale
+
+        return x_int8, scale if self.training else self.act_scale
+
+    def forward(self, x):
+        # Quantize activation
+        x_int8, act_scale = self.quantize_activation(x)
+
+        # Dequantize for computation
+        x_float = x_int8.float() * act_scale
+        weight_float = self.weight.float() * self.scales.unsqueeze(1)
+
+        return F.linear(x_float, weight_float, self.bias)
 
 
 def quantize(
