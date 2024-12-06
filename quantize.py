@@ -586,16 +586,17 @@ class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
             if not is_linear_weight:
                 cur_state_dict[key] = value
 
-        # Now handle Linear layer weights
-        for name, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                weight_int8, scales, _ = dynamically_quantize_per_channel(
-                    mod.weight.float(), -128, 127, torch.int8
-                )
+            # Now handle Linear layer weights
+            for fqn, mod in self.mod.named_modules():
+                if isinstance(mod, torch.nn.Linear):
+                    weight_int8, weight_scales, _ = dynamically_quantize_per_channel(
+                        mod.weight.float(), -128, 127, torch.int8
+                    )
 
-                # Use original key names
-                cur_state_dict[f"{name}.weight"] = weight_int8
-                cur_state_dict[f"{name}.scales"] = scales
+                # Update state dict with quantized components
+                cur_state_dict[f"{fqn}.weight"] = weight_int8
+                cur_state_dict[f"{fqn}.scales"] = weight_scales
+                cur_state_dict[f"{fqn}.act_scale"] = torch.ones(1, dtype=torch.float32)
 
         return cur_state_dict
 
