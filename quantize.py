@@ -534,34 +534,6 @@ class WeightOnlyInt4Linear(torch.nn.Module):
         )
 
 
-def symmetric_quantize_tensor(x, quant_min, quant_max, target_dtype):
-    """
-    Symmetric quantization for both weights and activations
-
-    Args:
-    x (torch.Tensor): Input tensor to quantize
-    quant_min (int): Minimum quantization value
-    quant_max (int): Maximum quantization value
-    target_dtype (torch.dtype): Target data type for quantization
-
-    Returns:
-    Tuple of (quantized_tensor, scale, zero_point)
-    """
-    # Compute scale based on max absolute value
-    max_val = torch.abs(x).max()
-    scale = max_val / ((quant_max - quant_min) / 2)
-
-    # Quantize
-    x_scaled = x / scale
-    x_rounded = torch.round(x_scaled)
-    x_clipped = torch.clamp(x_rounded, quant_min, quant_max)
-
-    # Zero point is 0 for symmetric quantization
-    zero_point = torch.tensor(0, dtype=torch.int64)
-
-    return x_clipped.to(target_dtype), scale, zero_point
-
-
 class WeightAndActivationInt8QuantHandler(WeightOnlyInt8QuantHandler):
     def convert_for_runtime(self):
         """Convert the model for runtime by replacing layers"""
