@@ -648,6 +648,23 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         return F.linear(x_float, weight_float, self.bias)
 
 
+def replace_linear_weight_and_activation_int8(module):
+    """Recursively replace linear layers with quantized version"""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            new_layer = WeightAndActivationInt8Linear(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                device=child.weight.device,
+                dtype=child.weight.dtype,
+            )
+            setattr(module, name, new_layer)
+        else:
+            replace_linear_weight_and_activation_int8(child)
+    return module
+
+
 def quantize(
     checkpoint_path: Path = Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"),
     mode: str = 'int8',
