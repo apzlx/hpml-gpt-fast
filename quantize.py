@@ -615,28 +615,24 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def quantize_activation(self, x):
-        """Quantize input activation"""
-        x_int8, scale, _ = symmetric_quantize_tensor(x, -128, 127, torch.int8)
-
-        # Update activation scale with moving average during training
-        if self.training:
-            self.act_scale = 0.9 * self.act_scale + 0.1 * scale
-
-        return x_int8, scale if self.training else self.act_scale
-
     def forward(self, x):
-        # Quantize activation
-        x_int8, act_scale = self.quantize_activation(x)
+        # Need to handle x with shape (batch_size, seq_length, hidden_dim)
+        # Transpose to get hidden_dim as first dimension for per-channel quantization
+        x_transposed = x.transpose(0, -1)  # (hidden_dim, seq_length, batch_size)
 
-        # Dequantize for computation
-        x_float = x_int8.float() * act_scale
-        weight_float = self.weight.float() * self.scales.unsqueeze(1)
+        # Quantize each channel (each hidden dim feature)
+        x_int8, act_scale, _ = dynamically_quantize_per_channel(
+            x_transposed.reshape(self.in_features, -1), -128, 127, torch.int8
+        )
 
-        x_float = x_float.to(dtype=x.dtype)
-        weight_float = weight_float.to(dtype=x.dtype)
+        # Reshape and transpose back
+        x_int8 = x_int8.reshape(self.in_features, -1, x.size(0)).transpose(0, -1)
 
-        return F.linear(x_float, weight_float, self.bias)
+        # Dequantize
+        x_dequant = (x_int8.float() * act_scale.unsqueeze(-1).unsqueeze(0)).to(x.dtype)
+        weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
+
+        return F.linear(x_dequant, weight_dequant, self.bias)
 
 
 def replace_linear_weight_and_activation_int8(module):
