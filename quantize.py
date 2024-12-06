@@ -601,11 +601,12 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             x_2d, -128, 127, torch.int8
         )
 
-        # Dequant and reshape back
-        x_dequant = (x_int8.T.float() * act_scale).reshape(orig_shape).to(x.dtype)
-
-        # Weight dequant and compute
+        # Make sure weight and activation dequant happen in the right dtype
         weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
+        x_dequant = (
+            (x_int8.T.float() * act_scale).reshape(orig_shape).to(weight_dequant.dtype)
+        )
+
         return F.linear(x_dequant, weight_dequant, self.bias)
 
 
