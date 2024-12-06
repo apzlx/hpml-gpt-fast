@@ -633,6 +633,9 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
         x_float = x_int8.float() * act_scale
         weight_float = self.weight.float() * self.scales.unsqueeze(1)
 
+        x_float = x_float.to(dtype=x.dtype)
+        weight_float = weight_float.to(dtype=x.dtype)
+
         return F.linear(x_float, weight_float, self.bias)
 
 
