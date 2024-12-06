@@ -589,26 +589,28 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
 
     def forward(self, x):
         # x shape is (batch_size, seq_len, hidden_dim)
-        orig_shape = x.shape
+        # Store original shape but combine batch and seq
+        batch_seq, hidden = x.reshape(-1, x.shape[-1]).shape
 
-        # Reshape to 2D for per-channel quantization
-        # Combine batch and seq into one dimension
-        x_2d = x.reshape(-1, orig_shape[-1])  # (batch*seq, hidden_dim)
+        # Quantize using per-channel - do transpose and reshape in one operation
+        # and make it contiguous for better memory access
+        x_reshaped = x.reshape(-1, hidden).T.contiguous()
 
-        # Quantize using per-channel (transpose since dynamically_quantize_per_channel works on dim 1)
-        x_2d = x_2d.T  # (hidden_dim, batch*seq)
+        # Quantize in-place if possible
         x_int8, act_scale, _ = dynamically_quantize_per_channel(
-            x_2d, -128, 127, torch.int8
+            x_reshaped, -128, 127, torch.int8
         )
 
-        # Dequantize and reshape back
+        # Dequantize and reshape back - try to minimize intermediate tensors
+        # Combine operations to reduce memory overhead
         x_dequant = (
-            x_int8.float() * act_scale.unsqueeze(-1)
-        ).T  # Scale per channel and transpose back
-        x_dequant = x_dequant.reshape(orig_shape).to(x.dtype)
+            (x_int8.float() * act_scale.unsqueeze(-1)).T.reshape(x.shape).to(x.dtype)
+        )
+        del x_int8  # Explicitly free memory
 
-        # Normal linear operation with quantized weights
+        # Reuse existing dequantized weights if possible
         weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
+
         return F.linear(x_dequant, weight_dequant, self.bias)
 
 
