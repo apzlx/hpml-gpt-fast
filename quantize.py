@@ -588,25 +588,18 @@ class WeightAndActivationInt8Linear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_len, hidden_dim)
-        orig_shape = x.shape
+        x_flat = x.view(-1, x.shape[-1])
 
-        # Reshape to 2D and transpose for per-channel quantization
-        x_2d = x.reshape(-1, orig_shape[-1]).T
-
-        # Single quantize call for all channels
         x_int8, act_scale, _ = dynamically_quantize_per_channel(
-            x_2d, -128, 127, torch.int8
+            x_flat.T, -128, 127, torch.int8
         )
-
-        # Make sure weight and activation dequant happen in the right dtype
         weight_dequant = (self.weight.float() * self.scales.unsqueeze(1)).to(x.dtype)
-        x_dequant = (
-            (x_int8.T.float() * act_scale).reshape(orig_shape).to(weight_dequant.dtype)
+
+        return F.linear(
+            (x_int8.T.float() * act_scale.unsqueeze(0)).to(x.dtype),
+            weight_dequant,
+            self.bias,
         )
-
-        return F.linear(x_dequant, weight_dequant, self.bias)
-
 
 def replace_linear_weight_and_activation_int8(module):
     """Recursively replace linear layers with quantized version"""
