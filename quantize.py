@@ -370,8 +370,9 @@ def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_til
         weight_bf16, n_bit=4, groupsize=groupsize
     )
     weight_uint8 = weight_int32.to(torch.uint8)
-    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_uint8, inner_k_tiles)
-    # weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_uint32, inner_k_tiles)
+    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
+        weight_uint8, inner_k_tiles
+    )
     return weight_int4pack, scales_and_zeros
 
 
@@ -407,21 +408,21 @@ def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
 class WeightOnlyInt4QuantHandler:
     def __init__(self, mod, groupsize=128, inner_k_tiles=8, padding=True):
         self.mod = mod
+        # Validate and set groupsize
+        assert groupsize in [32, 64, 128, 256], "groupsize must be 32, 64, 128 or 256"
         self.groupsize = groupsize
-        # Match inner_k_tiles to model expectations
-        self.inner_k_tiles = inner_k_tiles * 2  # Adjust to match the 64 vs 32 dimension
+
+        # Validate and set inner_k_tiles
+        assert inner_k_tiles in [2, 4, 8], "inner_k_tiles must be 2, 4 or 8"
+        self.inner_k_tiles = inner_k_tiles
+
         self.padding = padding
-        assert groupsize in [32, 64, 128, 256]
-        assert inner_k_tiles in [2, 4, 8]
 
     @torch.no_grad()
     def create_quantized_state_dict(self, use_cuda=True):
-        if use_cuda:
-            device = "cuda"
-        else:
-            device = "cpu"
-
+        device = "cuda" if use_cuda else "cpu"
         cur_state_dict = self.mod.state_dict()
+
         for fqn, mod in self.mod.named_modules():
             if isinstance(mod, torch.nn.Linear):
                 assert not mod.bias
@@ -431,23 +432,48 @@ class WeightOnlyInt4QuantHandler:
                 print(f"linear: {fqn}, in={in_features}, out={out_features}")
 
                 weight = mod.weight.data
-                if not _check_linear_int4_k(in_features, self.groupsize, self.inner_k_tiles):
+
+                # Check if padding is needed
+                needs_padding = not _check_linear_int4_k(
+                    in_features, self.groupsize, self.inner_k_tiles
+                )
+                if needs_padding:
                     if self.padding:
                         from model import find_multiple
                         import torch.nn.functional as F
-                        print(f"warning: {fqn} is padded to satisfy in_features % 1024 == 0")
+                        # Pad to satisfy 1024 alignment requirement
                         padded_in_features = find_multiple(in_features, 1024)
+                        print(
+                            f"warning: {fqn} is padded from {in_features} to {padded_in_features}"
+                        )
                         weight = F.pad(weight, pad=(0, padded_in_features - in_features))
+
+                        # Additional padding for inner_k_tiles alignment if needed
+                        if weight.size(1) % (self.inner_k_tiles * 16) != 0:
+                            final_size = find_multiple(
+                                weight.size(1), self.inner_k_tiles * 16
+                            )
+                            weight = F.pad(weight, pad=(0, final_size - weight.size(1)))
                     else:
-                        print(f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
-                            "and that groupsize and inner_k_tiles*16 evenly divide into it")
+                        print(f"warning: {fqn} is skipped due to size requirements")
                         continue
 
-                weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
-                    weight.to(torch.bfloat16).to(device=device), self.groupsize, self.inner_k_tiles
-                )
-                cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to('cpu')
-                cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to('cpu')
+                # Convert weight to proper format
+                try:
+                    weight_int4pack, scales_and_zeros = (
+                        prepare_int4_weight_and_scales_and_zeros(
+                            weight.to(torch.bfloat16).to(device=device),
+                            self.groupsize,
+                            self.inner_k_tiles,
+                        )
+                    )
+                    cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to("cpu")
+                    cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to(
+                        "cpu"
+                    )
+                except Exception as e:
+                    print(f"Error quantizing {fqn}: {str(e)}")
+                    raise
 
         return cur_state_dict
 
@@ -488,39 +514,63 @@ class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
         self.make_names_and_values_dict_func = make_names_and_values_dict_func
         super().__init__()
 
-
     def convert_for_runtime(self):
         replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
         return self.mod
 
-class WeightOnlyInt4Linear(torch.nn.Module):
-    __constants__ = ['in_features', 'out_features']
-    in_features: int
-    out_features: int
-    weight: torch.Tensor
 
+# Update the WeightOnlyInt4Linear class to match
+class WeightOnlyInt4Linear(torch.nn.Module):
     def __init__(
-            self, in_features: int, out_features: int,
-            bias=True, device=None, dtype=None, groupsize: int = 128, inner_k_tiles: int = 4, padding: bool = True,
+        self,
+        in_features: int,
+        out_features: int,
+        bias=True,
+        device=None,
+        dtype=None,
+        groupsize: int = 128,
+        inner_k_tiles: int = 8,
+        padding: bool = True,
     ) -> None:
         super().__init__()
+
+        # Handle padding if needed
         self.padding = padding
         if padding:
             from model import find_multiple
             self.origin_in_features = in_features
             in_features = find_multiple(in_features, 1024)
+            # Ensure in_features is also aligned with inner_k_tiles
+            if in_features % (inner_k_tiles * 16) != 0:
+                in_features = find_multiple(in_features, inner_k_tiles * 16)
 
         self.in_features = in_features
         self.out_features = out_features
         assert not bias, "require bias=False"
+
+        # Validate parameters
+        assert groupsize in [32, 64, 128, 256], "invalid groupsize"
+        assert inner_k_tiles in [2, 4, 8], "invalid inner_k_tiles"
+        assert out_features % 8 == 0, "require out_features % 8 == 0"
+        assert (
+            in_features % (inner_k_tiles * 16) == 0
+        ), "require in_features % (innerKTiles * 16) == 0"
+
         self.groupsize = groupsize
         self.inner_k_tiles = inner_k_tiles
 
-        assert out_features % 8 == 0, "require out_features % 8 == 0"
-        assert in_features % (inner_k_tiles * 16) == 0, "require in_features % (innerKTiles * 16) == 0"
+        # Register buffers with correct shapes
         self.register_buffer(
             "weight",
-            torch.empty((out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2), dtype=torch.int32)
+            torch.empty(
+                (
+                    out_features // 8,
+                    in_features // (inner_k_tiles * 16),
+                    32,
+                    inner_k_tiles // 2,
+                ),
+                dtype=torch.int32,
+            ),
         )
         self.register_buffer(
             "scales_and_zeros",
@@ -533,8 +583,7 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             import torch.nn.functional as F
             input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
         return linear_forward_int4(
-            input,
-            self.weight, self.scales_and_zeros, self.out_features, self.groupsize
+            input, self.weight, self.scales_and_zeros, self.out_features, self.groupsize
         )
 
 
