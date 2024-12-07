@@ -408,17 +408,18 @@ class WeightOnlyInt4QuantHandler:
     def __init__(self, mod, groupsize=128, inner_k_tiles=8, padding=True):
         self.mod = mod
         self.groupsize = groupsize
-        self.inner_k_tiles = inner_k_tiles
+        # Match inner_k_tiles to model expectations
+        self.inner_k_tiles = inner_k_tiles * 2  # Adjust to match the 64 vs 32 dimension
         self.padding = padding
         assert groupsize in [32, 64, 128, 256]
         assert inner_k_tiles in [2, 4, 8]
 
     @torch.no_grad()
-    def create_quantized_state_dict(self, use_cuda = True):
+    def create_quantized_state_dict(self, use_cuda=True):
         if use_cuda:
-            device="cuda"
+            device = "cuda"
         else:
-            device="cpu"
+            device = "cpu"
 
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
@@ -441,6 +442,7 @@ class WeightOnlyInt4QuantHandler:
                         print(f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
                             "and that groupsize and inner_k_tiles*16 evenly divide into it")
                         continue
+
                 weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
                     weight.to(torch.bfloat16).to(device=device), self.groupsize, self.inner_k_tiles
                 )
