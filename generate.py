@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
+from prefill_cache import PrefillCache, PrefillCacheContext
 
 import torch
 import torch._dynamo.config
@@ -136,6 +137,7 @@ def speculative_decode(
         next_token = multinomial_sample_one_no_sync(new)
         return torch.cat([draft_tokens[:accept_length], next_token])
 
+
 @torch.no_grad()
 def generate(
     model: Transformer,
@@ -146,8 +148,8 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
-    callback = lambda x: x,
-    **sampling_kwargs
+    callback=lambda x: x,
+    prefill_cache=None**sampling_kwargs,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -177,7 +179,38 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    ####### use prefill_cache to fill context #######
+    if prefill_cache is not None:
+        cts = prefill_cache.ctx.context_token_size - 1
+        if prefill_cache.need_to_prefill():
+            print(f"Prefilling cache with {cts} tokens")
+            next_token = prefill(
+                model,
+                prompt.view(-1)[0:cts].view(1, -1),
+                input_pos[0:cts],
+                **sampling_kwargs,
+            )
+            prefill_cache.save()
+            next_token = prefill(
+                model,
+                prompt.view(-1)[cts:T].view(1, -1),
+                input_pos[cts:T],
+                **sampling_kwargs,
+            )
+        else:
+            print("Loading from prefill cache")
+            prefill_cache.load()
+            next_token = prefill(
+                model,
+                prompt.view(-1)[cts:T].view(1, -1),
+                input_pos[cts:T],
+                **sampling_kwargs,
+            )
+    else:
+        next_token = prefill(
+            model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs
+        ).clone()
+
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
@@ -209,6 +242,7 @@ def generate(
         'accept_counts': accept_counts
     }
     return seq, generate_stats
+
 
 def encode_tokens(tokenizer, string, bos=True, device=default_device):
     tokens = tokenizer.encode(string)
@@ -269,6 +303,7 @@ def _get_model_size(model):
 
 B_INST, E_INST = "[INST]", "[/INST]"
 
+
 def main(
     prompt: Union[int, str] = "Hello, my name is",
     interactive: bool = False,
@@ -277,13 +312,16 @@ def main(
     batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
-    checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+    checkpoint_path: Path = Path(
+        "checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"
+    ),
     compile: bool = True,
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    prefill_context: Optional[str] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -327,6 +365,17 @@ def main(
         encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
     prompt_length = encoded.size(-1)
 
+    prefill_cache = None
+    if prefill_context:
+        encoded_context_length = encode_tokens(
+            tokenizer, prefill_context, bos=True, device=device
+        ).size(0)
+        prefill_cache = PrefillCache(device, device, cache_size=2)
+        prefill_cache_context = PrefillCacheContext(
+            prefill_context, encoded_context_length, model
+        )
+        prefill_cache.set_context(prefill_cache_context)
+
     torch.manual_seed(1234)
     model_size, params = _get_model_size(model)
     if compile:
@@ -343,7 +392,6 @@ def main(
         # Uncomment to squeeze more perf out of prefill
         if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
-
 
     aggregate_metrics = {
         'tokens_per_sec': [],
@@ -395,6 +443,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                prefill_cache=prefill_cache,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -461,10 +510,28 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument(
+        "--prefill_context",
+        type=str,
+        default=None,
+        help="Context to use for prefilling the cache",
+    )
 
     args = parser.parse_args()
     main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.prompt,
+        args.interactive,
+        args.num_samples,
+        args.max_new_tokens,
+        args.batch_size,
+        args.top_k,
+        args.temperature,
+        args.checkpoint_path,
+        args.compile,
+        args.compile_prefill,
+        args.profile,
+        args.draft_checkpoint_path,
+        args.speculate_k,
+        args.device,
+        args.prefill_context,
     )
