@@ -181,14 +181,14 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     ####### use prefill_cache to fill context #######
-    print(f"Context size: {cts}")
-    print(f"Prompt size: {T}")
-    print(f"Input positions shape: {input_pos.shape}")
-
     if prefill_cache is not None:
         cts = prefill_cache.get_context_token_size() - 1
         if cts is None:
             raise ValueError("No context set in prefill cache")
+
+        print(f"Context size: {cts}")
+        print(f"Prompt size: {T}")
+        print(f"Input positions shape: {input_pos.shape}")
 
         if prefill_cache.need_to_prefill():
             print(f"Prefilling cache with {cts} tokens")
