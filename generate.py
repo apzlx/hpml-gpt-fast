@@ -181,6 +181,10 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     ####### use prefill_cache to fill context #######
+    print(f"Context size: {cts}")
+    print(f"Prompt size: {T}")
+    print(f"Input positions shape: {input_pos.shape}")
+
     if prefill_cache is not None:
         cts = prefill_cache.get_context_token_size() - 1
         if cts is None:
@@ -188,32 +192,34 @@ def generate(
 
         if prefill_cache.need_to_prefill():
             print(f"Prefilling cache with {cts} tokens")
-            next_token = prefill(
-                model,
-                prompt.view(-1)[0:cts].view(1, -1),
-                input_pos[0:cts],
-                **sampling_kwargs,
-            )
-            prefill_cache.save()
-            next_token = prefill(
-                model,
-                prompt.view(-1)[cts:T].view(1, -1),
-                input_pos[cts:T],
-                **sampling_kwargs,
-            )
+            if cts > 0:
+                next_token = prefill(
+                    model,
+                    prompt.view(-1)[0:cts].view(1, -1),
+                    input_pos[0:cts],
+                    **sampling_kwargs,
+                )
+                prefill_cache.save()
+
+            remaining_tokens = prompt.view(-1)[cts:T]
+            if len(remaining_tokens) > 0:
+                next_token = prefill(
+                    model,
+                    remaining_tokens.view(1, -1),
+                    input_pos[cts:T],
+                    **sampling_kwargs,
+                )
         else:
             print("Loading from prefill cache")
             prefill_cache.load()
-            next_token = prefill(
-                model,
-                prompt.view(-1)[cts:T].view(1, -1),
-                input_pos[cts:T],
-                **sampling_kwargs,
-            )
-    else:
-        next_token = prefill(
-            model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs
-        ).clone()
+            remaining_tokens = prompt.view(-1)[cts:T]
+            if len(remaining_tokens) > 0:
+                next_token = prefill(
+                    model,
+                    remaining_tokens.view(1, -1),
+                    input_pos[cts:T],
+                    **sampling_kwargs,
+                )
 
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
