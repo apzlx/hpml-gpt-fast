@@ -149,7 +149,8 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     callback=lambda x: x,
-    prefill_cache=None**sampling_kwargs,
+    prefill_cache=None,
+    **sampling_kwargs,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
