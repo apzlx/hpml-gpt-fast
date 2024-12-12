@@ -182,7 +182,10 @@ def generate(
 
     ####### use prefill_cache to fill context #######
     if prefill_cache is not None:
-        cts = prefill_cache.ctx.context_token_size - 1
+        cts = prefill_cache.get_context_token_size() - 1
+        if cts is None:
+            raise ValueError("No context set in prefill cache")
+
         if prefill_cache.need_to_prefill():
             print(f"Prefilling cache with {cts} tokens")
             next_token = prefill(

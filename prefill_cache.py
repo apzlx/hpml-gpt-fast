@@ -21,6 +21,9 @@ class PrefillCache:
         self._cache_size = cache_size
         self._ctx: Optional[PrefillCacheContext] = None
 
+    def get_context_token_size(self) -> Optional[int]:
+        return self._ctx.context_token_size if self._ctx is not None else None
+
     def _enforce_cache_size_limit(self) -> None:
         if len(self._cache) >= self._cache_size:
             oldest_key = next(iter(self._cache))
