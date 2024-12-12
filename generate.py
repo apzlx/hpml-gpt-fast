@@ -189,37 +189,31 @@ def generate(
         print(f"Context size: {cts}")
         print(f"Prompt size: {T}")
         print(f"Input positions shape: {input_pos.shape}")
-
+        print(f"Prefilling with {cts} tokens")
         if prefill_cache.need_to_prefill():
-            print(f"Prefilling cache with {cts} tokens")
-            if cts > 0:
-                next_token = prefill(
-                    model,
-                    prompt.view(-1)[0:cts].view(1, -1),
-                    input_pos[0:cts],
-                    **sampling_kwargs,
-                )
-                prefill_cache.save()
-
-            remaining_tokens = prompt.view(-1)[cts:T]
-            if len(remaining_tokens) > 0:
-                next_token = prefill(
-                    model,
-                    remaining_tokens.view(1, -1),
-                    input_pos[cts:T],
-                    **sampling_kwargs,
-                )
+            next_token = prefill(
+                model,
+                prompt.view(-1)[0:cts].view(1, -1),
+                input_pos[0:cts],
+                **sampling_kwargs,
+            )
+            prefill_cache.save()
+            next_token = prefill(
+                model,
+                prompt.view(-1)[cts:T].view(1, -1),
+                input_pos[cts:T],
+                **sampling_kwargs,
+            )
         else:
-            print("Loading from prefill cache")
             prefill_cache.load()
-            remaining_tokens = prompt.view(-1)[cts:T]
-            if len(remaining_tokens) > 0:
-                next_token = prefill(
-                    model,
-                    remaining_tokens.view(1, -1),
-                    input_pos[cts:T],
-                    **sampling_kwargs,
-                )
+            next_token = prefill(
+                model,
+                prompt.view(-1)[cts:T].view(1, -1),
+                input_pos[cts:T],
+                **sampling_kwargs,
+            )
+    else:
+        next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
 
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
