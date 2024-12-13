@@ -370,16 +370,21 @@ def main(
         encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
     prompt_length = encoded.size(-1)
 
+    encoded_context = None
     prefill_cache = None
     if prefill_context:
-        encoded_context_length = encode_tokens(
+        # Encode the context and get its length
+        encoded_context = encode_tokens(
             tokenizer, prefill_context, bos=True, device=device
-        ).size(0)
-        prefill_cache = PrefillCache(device, device, cache_size=2)
-        prefill_cache_context = PrefillCacheContext(
-            prefill_context, encoded_context_length, model
         )
-        prefill_cache.set_context(prefill_cache_context)
+        encoded_context_length = encoded_context.size(0)
+        # Initialize and set up the prefill cache
+        prefill_cache = PrefillCache("cuda:0", "cuda:0", cache_size=2)
+        prefill_cache.set_context(
+            PrefillCacheContext(prefill_context, encoded_context_length, model)
+        )
+    # Get length of the main prompt
+    prompt_length = encoded.size(0)
 
     torch.manual_seed(1234)
     model_size, params = _get_model_size(model)
