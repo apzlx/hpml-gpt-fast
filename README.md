@@ -1,7 +1,7 @@
 # HPML Final Project: Optimization 
 # gpt-fast
 
-## To run prefill cache, prefill_context needs to be part of the prompt.
+### To run prefill cache, prefill_context needs to be part of the prompt.
 ```
 python generate.py \
     --compile \
