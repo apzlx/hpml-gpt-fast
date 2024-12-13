@@ -190,17 +190,18 @@ def generate(
         print(f"Prompt size: {T}")
         print(f"Input positions shape: {input_pos.shape}")
         print(f"Prefilling with {cts} tokens")
+
         if prefill_cache.need_to_prefill():
             next_token = prefill(
                 model,
-                prompt.view(-1)[0:cts].view(1, -1),
-                input_pos[0:cts],
+                prompt[:1, :cts],
+                input_pos[:cts],
                 **sampling_kwargs,
             )
             prefill_cache.save()
             next_token = prefill(
                 model,
-                prompt.view(-1)[cts:T].view(1, -1),
+                prompt[:, cts:T],
                 input_pos[cts:T],
                 **sampling_kwargs,
             )
@@ -208,7 +209,7 @@ def generate(
             prefill_cache.load()
             next_token = prefill(
                 model,
-                prompt.view(-1)[cts:T].view(1, -1),
+                prompt[:, cts:T],
                 input_pos[cts:T],
                 **sampling_kwargs,
             )
@@ -219,7 +220,6 @@ def generate(
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
 
     seq[:, T] = next_token.squeeze()
-
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
@@ -377,7 +377,7 @@ def main(
         encoded_context = encode_tokens(
             tokenizer, prefill_context, bos=True, device=device
         )
-        encoded_context_length = encoded_context.size(0)
+        encoded_context_length = encoded_context.size(-1)
         # Initialize and set up the prefill cache
         prefill_cache = PrefillCache("cuda:0", "cuda:0", cache_size=2)
         prefill_cache.set_context(
