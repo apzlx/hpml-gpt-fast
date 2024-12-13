@@ -1,5 +1,16 @@
 # HPML Final Project: Optimization 
 # gpt-fast
+
+## To run prefill cache, prefill_context needs to be part of the prompt.
+```
+python generate.py \
+    --compile \
+    --prefill_context "Welcome to TechCorp Support. I am an AI assistant trained to help with technical issues. Our support hours are 24/7, and returns must be initiated within 30 days." \
+    --prompt "Welcome to TechCorp Support. I am an AI assistant trained to help with technical issues. Our support hours are 24/7, and returns must be initiated within 30 days. What's the return policy for electronics?" \
+    --checkpoint_path checkpoints/$MODEL_REPO/model_int8.pth \
+    --num_samples 3
+```
+
 Simple and efficient pytorch-native transformer text generation.
 
 Featuring:
