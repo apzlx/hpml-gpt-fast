@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
 from prefill_cache import PrefillCache, PrefillCacheContext
+import contextlib
+
 
 import torch
 import torch._dynamo.config
