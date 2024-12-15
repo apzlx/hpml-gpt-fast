@@ -454,8 +454,12 @@ def main(
                 nonlocal done_generating
                 if done_generating:
                     return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
+                # Fix: Ensure we get a flat list of tokens
+                token_list = x.tolist() if isinstance(x, torch.Tensor) else x
+                if isinstance(token_list, list):
+                    token_list = token_list[0] if len(token_list) == 1 else token_list
+                buffer.append(tokenizer.decode([period_id, token_list]))
+                if token_list == tokenizer.eos_id():
                     done_generating = True
                 if len(buffer) == 4 or done_generating:
                     print(''.join(buffer), end='', flush=True)
