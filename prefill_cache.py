@@ -10,6 +10,7 @@ class PrefillCacheContext:
     context: str
     context_token_size: int
     model: Transformer
+    encoded_tokens: Tensor
 
 
 class PrefillCache:
@@ -20,6 +21,9 @@ class PrefillCache:
         self._cache_device = cache_device
         self._cache_size = cache_size
         self._ctx: Optional[PrefillCacheContext] = None
+
+    def get_context_tokens(self):
+        return self._ctx.encoded_tokens if self._ctx is not None else None
 
     def get_context_token_size(self) -> Optional[int]:
         return self._ctx.context_token_size if self._ctx is not None else None
