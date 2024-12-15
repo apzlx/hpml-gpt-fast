@@ -392,7 +392,9 @@ def main(
         )
         prefill_cache = PrefillCache("cuda:0", "cuda:0", cache_size=2)
         prefill_cache.set_context(
-            PrefillCacheContext(prefill_context, len(encoded_context), model)
+            PrefillCacheContext(
+                prefill_context, len(encoded_context), model, encoded_context
+            )
         )
         print(f"Initialized context with {len(encoded_context)} tokens")
 
