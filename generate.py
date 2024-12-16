@@ -184,9 +184,6 @@ def generate(
         if context_size is None:
             raise ValueError("No context set in prefill cache")
 
-        print(f"Context size: {context_size}")
-        print(f"Prompt size: {T}")
-
         if prefill_cache.need_to_prefill():
             # First time: process and cache the context
             next_token = prefill(
