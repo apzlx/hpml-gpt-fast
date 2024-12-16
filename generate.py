@@ -463,7 +463,7 @@ def main(
                 )
                 buffer.append(tokenizer.decode([period_id, tokens]))
 
-                if token_list == tokenizer.eos_id():
+                if tokens == tokenizer.eos_id():
                     done_generating = True
 
                 if len(buffer) == 4 or done_generating:
