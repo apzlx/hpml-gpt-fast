@@ -454,7 +454,6 @@ def main(
                 if done_generating:
                     return
                 token = x.item() if isinstance(x, torch.Tensor) else x
-                print(token)
                 buffer.append(tokenizer.decode([period_id, token])[1:])
                 if x.item() == tokenizer.eos_id():
                     done_generating = True
@@ -506,7 +505,8 @@ def main(
                 print("\nOnly displaying the first generation of the batch:")
             print(tokenizer.decode(y[0].tolist()))
         else:
-            print()  # New line after interactive generation
+            print(tokenizer.decode(y[0].tolist()))
+            # print()  # New line after interactive generation
 
         # Calculate performance metrics
         prompt_length = encoded.size(-1)
