@@ -449,26 +449,17 @@ def main(
             buffer = []
             period_id = tokenizer.encode('.')[0]
             done_generating = False
-
             def callback(x):
                 nonlocal done_generating
                 if done_generating:
                     return
-
-                tokens = x.tolist() if isinstance(x, torch.Tensor) else x
-                tokens = (
-                    tokens[0]
-                    if isinstance(tokens, list) and len(tokens) == 1
-                    else tokens
-                )
-                buffer.append(tokenizer.decode([period_id, tokens]))
-
-                if tokens == tokenizer.eos_id():
+                print([period_id] + x.tolist())
+                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
+                if x.item() == tokenizer.eos_id():
                     done_generating = True
-
-                if len(buffer) == 4 or done_generating:
-                    print(''.join(buffer), end='', flush=True)
-                    buffer.clear()
+            if len(buffer) == 4 or done_generating:
+                print("".join(buffer), end="", flush=True)
+                buffer.clear()
         else:
             callback = lambda x: x
 
