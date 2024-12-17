@@ -8,6 +8,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
+from prefill_cache import PrefillCache, PrefillCacheContext
+import contextlib
+
 
 import torch
 import torch._dynamo.config
@@ -70,7 +73,9 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=False, enable_math=True
+        ):  # Actually better for Inductor to codegen attention here
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
@@ -136,6 +141,7 @@ def speculative_decode(
         next_token = multinomial_sample_one_no_sync(new)
         return torch.cat([draft_tokens[:accept_length], next_token])
 
+
 @torch.no_grad()
 def generate(
     model: Transformer,
@@ -146,69 +152,130 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
-    callback = lambda x: x,
-    **sampling_kwargs
+    callback=lambda x: x,
+    prefill_cache=None,
+    **sampling_kwargs,
 ) -> torch.Tensor:
-    """
-    Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
-    """
 
     is_speculative = draft_model is not None
-    # create an empty tensor of the expected final shape and fill in the current tokens
+    device, dtype = prompt.device, prompt.dtype
+
+    # Get prompt size
     T = prompt.size(-1)
     T_new = T + max_new_tokens
+
     if interactive:
         max_seq_length = 350
     else:
         max_seq_length = min(T_new, model.config.block_size)
 
-    device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+
     with torch.device(device):
         model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(batch_size, T_new, dtype=dtype, device=device)
-    # We are just making the same prompt for every batch
     prompt = prompt.view(1, -1).repeat(batch_size, 1)
     empty[:, :T] = prompt
     seq = empty
-    input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    if prefill_cache is not None:
+        context_size = prefill_cache.get_context_token_size()
+        if context_size is None:
+            raise ValueError("No context set in prefill cache")
+
+        if prefill_cache.need_to_prefill():
+            # First time: process and cache the context
+            next_token = prefill(
+                model,
+                torch.tensor(
+                    prefill_cache.get_context_tokens(), device=device
+                ).unsqueeze(0),
+                torch.arange(0, context_size, device=device),
+                **sampling_kwargs,
+            )
+            prefill_cache.save()
+        else:
+            # Load cached context
+            prefill_cache.load()
+
+        # Process the new prompt
+        next_token = prefill(
+            model,
+            prompt,
+            torch.arange(context_size, context_size + T, device=device),
+            **sampling_kwargs,
+        )
+    else:
+        # No context, just process the prompt
+        next_token = prefill(
+            model,
+            prompt,
+            torch.arange(0, T, device=device),
+            **sampling_kwargs,
+        )
+
     if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+        prompt_offset = prefill_cache.get_context_token_size() if prefill_cache else 0
+        prefill(
+            draft_model,
+            prompt.view(batch_size, -1),
+            torch.arange(prompt_offset, prompt_offset + T, device=device),
+            **sampling_kwargs,
+        )
+
     seq[:, T] = next_token.squeeze()
+    current_position = T
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    accept_counts = [0] * (speculate_k + 1)
-
+    # Continue with generation
     if is_speculative:
-        input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        while input_pos < T_new - 1:
+        accept_counts = [0] * (speculate_k + 1)
+        while current_position < T_new - 1:
             cur_token = next_token.view(())
+            total_offset = (
+                prefill_cache.get_context_token_size() if prefill_cache else 0
+            ) + current_position
 
             next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+                model,
+                draft_model,
+                cur_token,
+                total_offset,
+                speculate_k,
+                **sampling_kwargs,
             )
 
             accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
-            for i in next_tokens[: num_added,]:
+            num_added = min(T_new - current_position - 1, len(next_tokens))
+            seq[:, current_position + 1 : current_position + num_added + 1] = (
+                next_tokens[:num_added]
+            )
+
+            for i in next_tokens[:num_added]:
                 callback(i)
-            input_pos = input_pos + num_added
+
+            current_position = current_position + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        input_pos = torch.tensor([current_position], device=device)
+        total_offset = prefill_cache.get_context_token_size() if prefill_cache else 0
+        input_pos = input_pos + total_offset
+
+        generated_tokens, _ = decode_n_tokens(
+            model,
+            next_token.view(batch_size, -1),
+            input_pos,
+            max_new_tokens - 1,
+            callback=callback,
+            **sampling_kwargs,
+        )
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
-    generate_stats = {
-        'accept_counts': accept_counts
-    }
+    generate_stats = {"accept_counts": accept_counts if is_speculative else None}
     return seq, generate_stats
+
 
 def encode_tokens(tokenizer, string, bos=True, device=default_device):
     tokens = tokenizer.encode(string)
@@ -284,6 +351,7 @@ def _get_model_size(model):
 
 B_INST, E_INST = "[INST]", "[/INST]"
 
+
 def main(
     prompt: Union[int, str] = "Hello, my name is",
     interactive: bool = False,
@@ -292,30 +360,25 @@ def main(
     batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
-    checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+    checkpoint_path: Path = Path(
+        "checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"
+    ),
     compile: bool = True,
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    prefill_context: Optional[str] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
+    Now handles context and prompt separately.
     """
     assert checkpoint_path.is_file(), checkpoint_path
-
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
-    global print
-    from tp import maybe_init_dist
-    rank = maybe_init_dist()
-    use_tp = rank is not None
-    if use_tp:
-        if rank != 0:
-            # only print on rank 0
-            print = lambda *args, **kwargs: None
-
+    # Initialize model and tokenizer
     print(f"Using device={device}")
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
@@ -323,57 +386,79 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
-
+    model = _load_model(
+        checkpoint_path, device, precision, False
+    )  # Assuming no TP for simplicity
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(draft_checkpoint_path, device, precision, False)
     else:
         draft_model = None
-
-    device_sync(device=device) # MKG
+    device_sync(device=device)
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
-    if isinstance(prompt, str):
-        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    else:
-        # generate a fully synthetic prompt
-        encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
-    prompt_length = encoded.size(-1)
+    # Set up prefill cache if context is provided
+    prefill_cache = None
+    if prefill_context:
+        encoded_context = encode_tokens(
+            tokenizer, prefill_context, bos=True, device=device
+        )
+        prefill_cache = PrefillCache("cuda:0", "cuda:0", cache_size=2)
+        prefill_cache.set_context(
+            PrefillCacheContext(
+                prefill_context, len(encoded_context), model, encoded_context
+            )
+        )
+        print(f"Initialized context with {len(encoded_context)} tokens")
 
-    torch.manual_seed(1234)
-    model_size, params = _get_model_size(model)
+    # Compile if requested
     if compile:
-        if is_speculative and use_tp: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
-
         if is_speculative:
-            global model_forward, logits_to_prob
+            global model_forward
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
-        # Uncomment to squeeze more perf out of prefill
         if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
 
-
+    # Initialize metrics tracking
     aggregate_metrics = {
         'tokens_per_sec': [],
         'accept_counts': [],
     }
+
+    # Main generation loop
     start = -1 if compile else 0
-
     for i in range(start, num_samples):
-        device_sync(device=device) # MKG
-        if i >= 0 and interactive:
-            prompt = input("What is your prompt? ")
-            if is_chat:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        device_sync(device=device)
 
+        # Handle interactive prompt input
+        if i >= 0 and interactive:
+            try:
+                prompt = input("Enter your prompt (Ctrl+C to exit): ")
+                if is_chat:
+                    prompt = f"{B_INST} {prompt.strip()} {E_INST}"
+                encoded = encode_tokens(
+                    tokenizer, prompt, bos=False, device=device
+                )  # No BOS since context has it
+            except KeyboardInterrupt:
+                print("\nExiting interactive mode...")
+                break
+        else:
+            if isinstance(prompt, str):
+                encoded = encode_tokens(
+                    tokenizer, prompt, bos=not bool(prefill_context), device=device
+                )
+            else:
+                # Generate synthetic prompt
+                encoded = torch.randint(
+                    0, 1024, (prompt,), device=device, dtype=torch.int64
+                )
+
+        # Set up streaming output for interactive mode
         if interactive and i >= 0:
             buffer = []
             period_id = tokenizer.encode('.')[0]
@@ -382,23 +467,23 @@ def main(
                 nonlocal done_generating
                 if done_generating:
                     return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
+                token = x.item() if isinstance(x, torch.Tensor) else x
+                buffer.append(tokenizer.decode([period_id, token])[1:])
                 if x.item() == tokenizer.eos_id():
                     done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print(''.join(buffer), end='', flush=True)
-                    buffer.clear()
-                # print(, end='', flush=True)
+            if len(buffer) == 4 or done_generating:
+                print("".join(buffer), end="", flush=True)
+                buffer.clear()
         else:
-            callback = lambda x : x
+            callback = lambda x: x
+
+        # Generation
         t0 = time.perf_counter()
-        import contextlib
-        if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
-            prof = contextlib.nullcontext()
-        else:
-            torch.profiler._utils._init_for_cuda_graphs()
-            prof = torch.profiler.profile()
-        with prof:
+        with (
+            contextlib.nullcontext()
+            if i != num_samples - 1 or not profile
+            else torch.profiler.profile()
+        ) as prof:
             y, metrics = generate(
                 model,
                 encoded,
@@ -410,46 +495,67 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                prefill_cache=prefill_cache,
             )
-            aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
+
+            if metrics["accept_counts"]:
+                aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
+
+        # Handle compilation warmup
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
+
+        # Export profile if requested
         if hasattr(prof, "export_chrome_trace"):
-            if use_tp:
-                prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
-            else:
-                prof.export_chrome_trace(f"{profile}.json")
-        device_sync(device=device) # MKG
+            prof.export_chrome_trace(f"{profile}.json")
+
+        # Compute and display metrics
+        device_sync(device=device)
         t = time.perf_counter() - t0
 
         if not interactive:
-            # Just displaying the first generation
             if batch_size > 1:
-                print("Only displaying the first generation of the batch")
+                print("\nOnly displaying the first generation of the batch:")
             print(tokenizer.decode(y[0].tolist()))
         else:
-            print()
-        tokens_generated = y.size(-1) - prompt_length
-        generated_tokens_sec = tokens_generated / t
-        aggregate_metrics['tokens_per_sec'].append(generated_tokens_sec)
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {generated_tokens_sec:.02f} tokens/sec")
-        print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
-        total_tokens_sec = y.numel() / t
-        print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
-        print()
-    print("==========")
-    if is_speculative:
-        counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
-        acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
-        print(f"Acceptance probs: {acceptance_probs}")
-        print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
+            print(tokenizer.decode(y[0].tolist()))
+            # print()  # New line after interactive generation
 
-    print(f"Batch Size: {batch_size}")
-    print(f"Prompt Length: {prompt_length}")
-    print(f"Generated tokens: {max_new_tokens}")
-    print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+        # Calculate performance metrics
+        prompt_length = encoded.size(-1)
+        tokens_generated = y.size(-1) - prompt_length
+        tokens_per_sec = tokens_generated / t
+        aggregate_metrics["tokens_per_sec"].append(tokens_per_sec)
+
+        # Display performance statistics
+        model_size, params = _get_model_size(model)
+        print(f"\nGeneration {i + 1} stats:")
+        print(f"Time: {t:.02f} sec")
+        print(f"Speed: {tokens_per_sec:.02f} tokens/sec")
+        print(f"Bandwidth: {model_size * tokens_per_sec / 1e9:.02f} GB/s")
+        print(f"Compute: {params * (y.numel() / t) * 2 / 1e12:.02f} TF/s")
+
+    # Final summary
+    print("\n========== Final Summary ==========")
+    if is_speculative and aggregate_metrics["accept_counts"]:
+        counts = [sum(i) for i in zip(*aggregate_metrics["accept_counts"])]
+        probs = [i / sum(counts) for i in counts]
+        print(f"Acceptance probabilities: {probs}")
+        print(
+            f"Mean tokens accepted: {sum([idx * i for idx, i in enumerate(counts)])/sum(counts):.2f}"
+        )
+
+    print(f"Configuration:")
+    print(f"- Batch Size: {batch_size}")
+    print(
+        f"- Context Length: {prefill_cache.get_context_token_size() if prefill_cache else 0}"
+    )
+    print(
+        f"- Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}"
+    )
+    print(f"Resources:")
+    print(f"- GPU Memory: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
 
 if __name__ == '__main__':
@@ -476,10 +582,28 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument(
+        "--prefill_context",
+        type=str,
+        default=None,
+        help="Context to use for prefilling the cache",
+    )
 
     args = parser.parse_args()
     main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.prompt,
+        args.interactive,
+        args.num_samples,
+        args.max_new_tokens,
+        args.batch_size,
+        args.top_k,
+        args.temperature,
+        args.checkpoint_path,
+        args.compile,
+        args.compile_prefill,
+        args.profile,
+        args.draft_checkpoint_path,
+        args.speculate_k,
+        args.device,
+        args.prefill_context,
     )
