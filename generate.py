@@ -26,7 +26,7 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
 torch._inductor.config.fx_graph_cache = True 
-torch._functorch.config.enable_autograd_cache = True
+# torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -221,13 +221,28 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
-    if "int8" in str(checkpoint_path):
+    if "hybrid" in str(checkpoint_path):
+        print("Using int4, int8 hybrid quantization!")
+        from quantize import HybridQuantHandler
+
+        simple_quantizer = HybridQuantHandler(model)
+        model = simple_quantizer.convert_for_runtime()
+
+    elif "int8-activation" in str(checkpoint_path):
+        print("Using int8 weight-activation quantization!")
+        from quantize import WeightAndActivationInt8QuantHandler
+
+        simple_quantizer = WeightAndActivationInt8QuantHandler(model)
+        model = simple_quantizer.convert_for_runtime()
+
+    elif "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyInt8QuantHandler
+
         simple_quantizer = WeightOnlyInt8QuantHandler(model)
         model = simple_quantizer.convert_for_runtime()
 
-    if "int4" in str(checkpoint_path):
+    elif "int4" in str(checkpoint_path):
         print("Using int4 weight-only quantization!")
         path_comps = checkpoint_path.name.split(".")
         groupsize = int(path_comps[-2][1:])
