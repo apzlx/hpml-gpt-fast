@@ -46,8 +46,13 @@ class EnhancedHybridQuantHandler(QuantHandler):
 
     def _measure_layer_runtime(self) -> Dict[str, float]:
         print("Starting runtime analysis...")
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {device}")
+
+        # Move input positions to correct device at creation
+        if not hasattr(self, "input_pos"):
+            self.input_pos = torch.arange(self.sample_sequence_length).to(device)
 
         runtimes = {}
         hooks = []
@@ -270,11 +275,15 @@ class QuantMethodAnalyzer:
 
             print("Model loaded successfully")
 
+            # Initialize model caches
             print("Initializing model caches...")
             self.model.setup_caches(
                 max_batch_size=self.sample_batch_size,
                 max_seq_length=self.sample_sequence_length,
             )
+
+            # Move causal mask to the correct device
+            self.model.causal_mask = self.model.causal_mask.to(device)
 
             # Generate calibration data
             calibration_data = self._generate_calibration_data()
