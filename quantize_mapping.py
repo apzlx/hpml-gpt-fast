@@ -13,6 +13,7 @@ import argparse
 
 
 class EnhancedHybridQuantHandler(QuantHandler):
+
     def __init__(
         self,
         model: nn.Module,
@@ -22,6 +23,7 @@ class EnhancedHybridQuantHandler(QuantHandler):
         accuracy_threshold: float = 0.1,  # Threshold for accuracy impact
         runtime_threshold: float = 0.05,  # Threshold for runtime importance
         calibration_data: Optional[torch.Tensor] = None,  # Sample input for analysis
+        input_pos: Optional[torch.Tensor] = None,
     ):
         super().__init__(model)
         self.model = model
@@ -31,6 +33,7 @@ class EnhancedHybridQuantHandler(QuantHandler):
         self.accuracy_threshold = accuracy_threshold
         self.runtime_threshold = runtime_threshold
         self.calibration_data = calibration_data
+        self.input_pos = input_pos
         self.layer_stats = {}
 
         # Initialize analysis results
@@ -256,6 +259,7 @@ class QuantMethodAnalyzer:
                 accuracy_threshold=self.accuracy_threshold,
                 runtime_threshold=self.runtime_threshold,
                 calibration_data=calibration_data,
+                input_pos=input_pos,
             )
 
             # Generate mapping dictionary
