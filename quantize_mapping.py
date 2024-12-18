@@ -66,7 +66,7 @@ class EnhancedHybridQuantHandler(QuantHandler):
         # Run multiple forward passes to get stable measurements
         with torch.no_grad():
             for _ in range(10):  # Multiple runs for stable measurements
-                self.model(self.calibration_data)
+                self.model(self.calibration_data, self.input_pos)
 
         # Remove hooks
         for hook in hooks:
@@ -211,11 +211,11 @@ class QuantMethodAnalyzer:
 
     def _generate_calibration_data(self) -> torch.Tensor:
         """Generate sample input data for analysis."""
-        return torch.randn(
-            self.sample_batch_size,
-            self.sample_sequence_length,
-            self.model.config.dim,
-            dtype=torch.bfloat16,
+        return torch.randint(
+            0,
+            self.model.config.vocab_size,
+            (self.sample_batch_size, self.sample_sequence_length),
+            dtype=torch.long,
         )
 
     def analyze_and_save(self, output_path: Optional[Path] = None) -> Dict[str, str]:
@@ -238,8 +238,15 @@ class QuantMethodAnalyzer:
             model = model.to(dtype=precision, device=device)
             self.model = model
 
+            print("Initializing model caches...")
+            self.model.setup_caches(
+                max_batch_size=self.sample_batch_size,
+                max_seq_length=self.sample_sequence_length,
+            )
+
             # Generate calibration data
             calibration_data = self._generate_calibration_data()
+            input_pos = torch.arange(self.sample_sequence_length)
 
             # Create enhanced handler with analysis capabilities
             handler = EnhancedHybridQuantHandler(
