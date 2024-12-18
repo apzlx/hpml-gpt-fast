@@ -214,7 +214,7 @@ class QuantMethodAnalyzer:
         return torch.randn(
             self.sample_batch_size,
             self.sample_sequence_length,
-            self.model.config.hidden_size,
+            self.model.config.dim,
             dtype=torch.bfloat16,
         )
 
@@ -308,6 +308,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint-path", type=Path, required=True, help="Path to model checkpoint"
     )
+
     parser.add_argument(
         "--output-path",
         type=Path,
