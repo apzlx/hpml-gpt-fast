@@ -262,17 +262,15 @@ class QuantMethodAnalyzer:
         t0 = time.time()
 
         try:
-            # Load model using your existing hybrid_quantize infrastructure
+            # load model
             with torch.device("meta"):
                 model = Transformer.from_name(self.checkpoint_path.parent.name)
-
             checkpoint = torch.load(
                 str(self.checkpoint_path), mmap=True, weights_only=True
             )
             model.load_state_dict(checkpoint, assign=True)
             model = model.to(dtype=precision, device=device)
             self.model = model
-
             print("Model loaded successfully")
 
             # Initialize model caches
