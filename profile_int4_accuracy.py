@@ -100,19 +100,14 @@ def capture_activations_during_generation(
 
     with torch.no_grad():
         input_pos = torch.arange(0, seq_length, device=device)
-
-        # First do prefill
         logits = model(sample_input, input_pos)
+        next_token = sample_last_token(logits)
 
-        # Then do token-by-token generation
-        current_token = sample_last_token(logits)
-        current_pos = seq_length
-
+        cur_token = next_token
         for i in tqdm(range(max_new_tokens), desc=f"{model_type} generation"):
-            pos = torch.tensor([current_pos], device=device)
-            logits = model(current_token.unsqueeze(0), pos)
-            current_token = sample_last_token(logits)
-            current_pos += 1
+            pos = torch.tensor([[seq_length + i]], device=device)
+            logits = model(cur_token.view(1, 1), pos)
+            cur_token = sample_last_token(logits)
 
     # Save activations
     print(f"\n💾 Saving {model_type} activations...")
