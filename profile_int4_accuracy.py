@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from tqdm import tqdm
 import time
+from model import Transformer
 
 
 def load_model(path: str, device: str = "cuda") -> nn.Module:
