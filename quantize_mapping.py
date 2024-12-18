@@ -45,50 +45,69 @@ class EnhancedHybridQuantHandler(QuantHandler):
             self._analyze_layer_characteristics()
 
     def _measure_layer_runtime(self) -> Dict[str, float]:
+        print("Starting runtime analysis...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+
         runtimes = {}
         hooks = []
 
-        def timer_hook(name):
+        # First collect all linear layer names
+        linear_layers = {}
+        total_layers = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_layers[name] = module
+                runtimes[name] = []
+                total_layers += 1
+        print(f"Found {total_layers} linear layers to analyze")
 
+        def timer_hook(name):
             def hook(module, input, output):
-                if name not in runtimes:
-                    runtimes[name] = []
-                return output  # Just return the output without calling module again
+                return output
 
             return hook
 
         # Register hooks for all linear layers
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                hooks.append(module.register_forward_hook(timer_hook(name)))
+        print("Registering hooks...")
+        for name, module in linear_layers.items():
+            hooks.append(module.register_forward_hook(timer_hook(name)))
 
         # Run multiple forward passes with time measurement
+        n_passes = 10
+        print(f"Running {n_passes} forward passes for measurement...")
         with torch.no_grad():
-            for _ in range(10):
-                start_times = {name: time.perf_counter() for name in runtimes.keys()}
-                self.model(self.calibration_data, self.input_pos)
-                end_times = {name: time.perf_counter() for name in runtimes.keys()}
+            for i in range(n_passes):
+                start_times = {
+                    name: time.perf_counter() for name in linear_layers.keys()
+                }
+                self.model(self.calibration_data.to(device), self.input_pos.to(device))
+                end_times = {name: time.perf_counter() for name in linear_layers.keys()}
 
-                for name in runtimes:
+                for name in linear_layers.keys():
                     runtimes[name].append(end_times[name] - start_times[name])
+                print(f"Completed pass {i+1}/{n_passes}")
 
         # Remove hooks
+        print("Cleaning up hooks...")
         for hook in hooks:
             hook.remove()
 
         # Average the runtimes
+        print("Computing average runtimes...")
         return {name: sum(times) / len(times) for name, times in runtimes.items()}
 
     def _measure_layer_sensitivity(self) -> Dict[str, float]:
-        """Measure each layer's sensitivity to quantization."""
+        print("Starting accuracy sensitivity analysis...")
         sensitivities = {}
 
         def evaluate_model():
             self.model.eval()
             with torch.no_grad():
-                return self.model(self.calibration_data)
+                return self.model(self.calibration_data, self.input_pos)
 
         # Store original weights
+        print("Storing original weights...")
         original_state = {
             name: module.weight.data.clone()
             for name, module in self.model.named_modules()
@@ -96,9 +115,12 @@ class EnhancedHybridQuantHandler(QuantHandler):
         }
 
         baseline_output = evaluate_model()
+        total_layers = len(original_state)
+        print(f"Analyzing sensitivity for {total_layers} layers...")
 
-        for name, module in self.model.named_modules():
+        for i, (name, module) in enumerate(self.model.named_modules(), 1):
             if isinstance(module, nn.Linear):
+                print(f"Analyzing layer {i}/{total_layers}: {name}")
                 # Simulate quantization impact
                 original_weight = module.weight.data
 
@@ -215,19 +237,23 @@ class QuantMethodAnalyzer:
 
     def _generate_calibration_data(self) -> torch.Tensor:
         """Generate sample input data for analysis."""
-        return torch.randint(
-            0,
-            self.model.config.vocab_size,
-            (self.sample_batch_size, self.sample_sequence_length),
-            dtype=torch.long,
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("Generating calibration data...")
+        return torch.randn(
+            self.sample_batch_size,
+            self.sample_sequence_length,
+            self.model.config.dim,
+            dtype=torch.bfloat16,
+            device=device,
         )
 
     def analyze_and_save(self, output_path: Optional[Path] = None) -> Dict[str, str]:
         """Analyze model and generate quantization method mapping."""
-        device = "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         precision = torch.bfloat16
 
         print(f"Analyzing model from {self.checkpoint_path}...")
+        print(f"Using device: {device}")
         t0 = time.time()
 
         try:
@@ -241,6 +267,8 @@ class QuantMethodAnalyzer:
             model.load_state_dict(checkpoint, assign=True)
             model = model.to(dtype=precision, device=device)
             self.model = model
+
+            print("Model loaded successfully")
 
             print("Initializing model caches...")
             self.model.setup_caches(
