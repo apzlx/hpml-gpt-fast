@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -9,6 +10,58 @@ import os
 import json
 from model import Transformer
 from quantize import WeightOnlyInt8QuantHandler, WeightOnlyInt4QuantHandler
+
+
+def print_gpu_memory():
+    """Print current GPU memory usage"""
+    if torch.cuda.is_available():
+        used = torch.cuda.memory_allocated() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"🎯 GPU Memory: {used:.2f}GB used / {total:.2f}GB total")
+
+
+def load_model(path: str, device: str = "cuda") -> nn.Module:
+    # Create model instance
+    print("🔧 Creating model instance...")
+    with torch.device("meta"):
+        model = Transformer.from_name(Path(path).parent.name)
+    print("✓ Model architecture created")
+
+    """Load a model and move it to specified device"""
+    print(f"\n📂 Loading model from {path}...")
+
+    if "int8" in str(path):
+        print("Using int8 weight-only quantization!")
+        simple_quantizer = WeightOnlyInt8QuantHandler(model)
+        model = simple_quantizer.convert_for_runtime()
+
+    elif "int4" in str(path):
+        print("Using int4 weight-only quantization!")
+        path_comps = Path(path).name.split(".")
+        groupsize = int(path_comps[-2][1:])
+        simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
+        model = simple_quantizer.convert_for_runtime()
+
+    # Load weights
+    print("📦 Loading weights...")
+    checkpoint = torch.load(str(path), mmap=True, weights_only=True)
+    if isinstance(checkpoint, dict):
+        if "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
+    else:
+        raise ValueError(f"Unexpected checkpoint type: {type(checkpoint)}")
+
+    model.load_state_dict(state_dict, assign=True)
+    print("✓ Weights loaded")
+
+    # Move to device
+    print(f"🚀 Moving model to {device}...")
+    model = model.to(device=device)
+    print(f"✓ Model ready!")
+
+    return model
 
 
 def process_single_model(
@@ -132,6 +185,50 @@ def compare_saved_activations(save_dir: str) -> Dict[str, Dict[str, float]]:
             print(f"   INT4 difference: {float(int4_diff)*100:.2f}%")
 
     return results
+
+
+def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
+    """Print analysis of layer comparisons"""
+    print("\n📊 Layer Analysis Results:")
+    print("=" * 100)
+    print(
+        f"{'Layer Name':<40} {'INT8 Diff %':<12} {'INT4 Diff %':<12} {'INT8 Cos Sim':<12} {'INT4 Cos Sim':<12}"
+    )
+    print("-" * 100)
+
+    # Sort by INT4 difference
+    sorted_results = dict(
+        sorted(results.items(), key=lambda x: x[1]["int4_relative_diff"], reverse=True)
+    )
+
+    for name, metrics in sorted_results.items():
+        print(
+            f"{name:<40} "
+            f"{metrics['int8_relative_diff']*100:>10.2f}% "
+            f"{metrics['int4_relative_diff']*100:>11.2f}% "
+            f"{metrics['int8_cosine_sim']:>11.4f} "
+            f"{metrics['int4_cosine_sim']:>11.4f}"
+        )
+
+    # Summary statistics
+    int8_diffs = [m["int8_relative_diff"] for m in results.values()]
+    int4_diffs = [m["int4_relative_diff"] for m in results.values()]
+
+    print("\n📈 Summary Statistics:")
+    print(f"INT8 Average Difference: {np.mean(int8_diffs)*100:.2f}%")
+    print(f"INT4 Average Difference: {np.mean(int4_diffs)*100:.2f}%")
+    print(
+        f"Most Affected Layer: {max(results.items(), key=lambda x: x[1]['int4_relative_diff'])[0]}"
+    )
+
+    print("\n📊 Distribution of Differences:")
+    thresholds = [0.01, 0.05, 0.1, 0.2]
+    for thresh in thresholds:
+        int8_count = sum(1 for x in int8_diffs if x > thresh)
+        int4_count = sum(1 for x in int4_diffs if x > thresh)
+        print(f"Layers with >{thresh*100}% difference:")
+        print(f"  INT8: {int8_count} layers ({int8_count/len(int8_diffs)*100:.1f}%)")
+        print(f"  INT4: {int4_count} layers ({int4_count/len(int4_diffs)*100:.1f}%)")
 
 
 def main():
