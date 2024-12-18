@@ -6,9 +6,10 @@ import numpy as np
 from tqdm import tqdm
 
 
-def load_model(path: str) -> nn.Module:
-    """Load a model from path"""
-    return torch.load(path, map_location="cpu")
+def load_model(path: str, device: str = "cuda") -> nn.Module:
+    """Load a model and move it to specified device"""
+    model = torch.load(path)
+    return model.to(device)
 
 
 def compare_layer_outputs(
@@ -16,12 +17,19 @@ def compare_layer_outputs(
     int8_model: nn.Module,
     int4_model: nn.Module,
     sample_input: torch.Tensor,
+    device: str = "cuda",
     layer_names: List[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compare outputs of each layer across models.
-    Returns dict with differences for each layer.
+    Compare outputs of each layer across models on specified device.
     """
+    # Move models to device
+    fp_model = fp_model.to(device)
+    int8_model = int8_model.to(device)
+    int4_model = int4_model.to(device)
+    sample_input = sample_input.to(device)
+
+    # Set to eval mode
     fp_model.eval()
     int8_model.eval()
     int4_model.eval()
@@ -34,8 +42,8 @@ def compare_layer_outputs(
 
     def get_activation(name, model_type):
         def hook(module, input, output):
+            # Store activation on same device
             activations[model_type][name] = output.detach()
-
         return hook
 
     # Register hooks for each model
@@ -56,9 +64,22 @@ def compare_layer_outputs(
 
     # Forward pass
     with torch.no_grad():
-        fp_model(sample_input)
-        int8_model(sample_input)
-        int4_model(sample_input)
+        try:
+            # Clear CUDA cache before each forward pass
+            torch.cuda.empty_cache()
+            fp_model(sample_input)
+
+            torch.cuda.empty_cache()
+            int8_model(sample_input)
+
+            torch.cuda.empty_cache()
+            int4_model(sample_input)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("CUDA out of memory! Try reducing batch size or sequence length")
+                raise
+            else:
+                raise
 
     # Compare activations
     for name in tqdm(activations["fp"].keys(), desc="Analyzing layers"):
@@ -83,15 +104,16 @@ def compare_layer_outputs(
         )
 
         results[name] = {
-            "int8_relative_diff": float(int8_diff),
-            "int4_relative_diff": float(int4_diff),
-            "int8_cosine_sim": float(int8_cos),
-            "int4_cosine_sim": float(int4_cos),
+            "int8_relative_diff": float(int8_diff.cpu()),
+            "int4_relative_diff": float(int4_diff.cpu()),
+            "int8_cosine_sim": float(int8_cos.cpu()),
+            "int4_cosine_sim": float(int4_cos.cpu()),
         }
 
-    # Clean up hooks
+    # Clean up hooks and clear cache
     for hook in hooks:
         hook.remove()
+    torch.cuda.empty_cache()
 
     return results
 
@@ -125,7 +147,6 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
         f"Most Affected Layer: {max(results.items(), key=lambda x: x[1]['int4_relative_diff'])[0]}"
     )
 
-
 def main():
     import argparse
 
@@ -134,23 +155,32 @@ def main():
     parser.add_argument("--int8-model", type=str, required=True)
     parser.add_argument("--int4-model", type=str, required=True)
     parser.add_argument("--sample-seq-length", type=int, default=512)
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     args = parser.parse_args()
 
-    # Load models
-    print("Loading models...")
-    fp_model = load_model(args.fp_model)
-    int8_model = load_model(args.int8_model)
-    int4_model = load_model(args.int4_model)
+    # Check CUDA availability if cuda selected
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        args.device = "cpu"
 
-    # Create sample input
-    sample_input = torch.randn(1, args.sample_seq_length, fp_model.config.hidden_size)
+    # Load models
+    print(f"Loading models to {args.device}...")
+    fp_model = load_model(args.fp_model, args.device)
+    int8_model = load_model(args.int8_model, args.device)
+    int4_model = load_model(args.int4_model, args.device)
+
+    # Create sample input on device
+    sample_input = torch.randn(
+        1, args.sample_seq_length, fp_model.config.hidden_size, device=args.device
+    )
 
     # Compare models
-    results = compare_layer_outputs(fp_model, int8_model, int4_model, sample_input)
+    results = compare_layer_outputs(
+        fp_model, int8_model, int4_model, sample_input, device=args.device
+    )
 
     # Print analysis
     analyze_and_print_results(results)
-
 
 if __name__ == "__main__":
     main()
