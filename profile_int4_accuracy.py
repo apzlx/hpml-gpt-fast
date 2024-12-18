@@ -11,10 +11,38 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
     """Load a model and move it to specified device"""
     print(f"\n📂 Loading model from {path}...")
     start_time = time.time()
-    model = torch.load(path)
-    print(f"✓ Model loaded, moving to {device}...")
-    model = model.to(device)
+
+    # First load state dict
+    checkpoint = torch.load(path)
+    print("✓ Checkpoint loaded")
+
+    # Create model instance
+    print("🔧 Creating model instance...")
+    model_name = Path(path).parent.name
+    with torch.device("meta"):
+        model = Transformer.from_name(model_name)
+    print("✓ Model architecture created")
+
+    # Load weights
+    print("📦 Loading weights...")
+    if isinstance(checkpoint, dict):
+        if "model" in checkpoint:
+            # Handle case where state dict is nested under 'model' key
+            state_dict = checkpoint["model"]
+        else:
+            # Assume the dict is the state dict
+            state_dict = checkpoint
+    else:
+        raise ValueError(f"Unexpected checkpoint type: {type(checkpoint)}")
+
+    model.load_state_dict(state_dict, assign=True)
+    print("✓ Weights loaded")
+
+    # Move to device
+    print(f"🚀 Moving model to {device}...")
+    model = model.to(device=device)
     print(f"✓ Model ready! Took {time.time() - start_time:.2f}s")
+
     return model
 
 
