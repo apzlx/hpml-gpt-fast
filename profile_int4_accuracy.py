@@ -80,8 +80,6 @@ def process_single_model(
     model.setup_caches(
         max_batch_size=batch_size,
         max_seq_length=seq_length,
-        dtype=torch.float16,
-        device=device,
     )
 
     activations = {}
