@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
 import time
@@ -13,7 +12,6 @@ from quantize import WeightOnlyInt8QuantHandler, WeightOnlyInt4QuantHandler
 
 
 def print_gpu_memory():
-    """Print current GPU memory usage"""
     if torch.cuda.is_available():
         used = torch.cuda.memory_allocated() / 1024**3
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -21,13 +19,11 @@ def print_gpu_memory():
 
 
 def load_model(path: str, device: str = "cuda") -> nn.Module:
-    # Create model instance
     print("🔧 Creating model instance...")
     with torch.device("meta"):
         model = Transformer.from_name(Path(path).parent.name)
     print("✓ Model architecture created")
 
-    """Load a model and move it to specified device"""
     print(f"\n📂 Loading model from {path}...")
 
     if "int8" in str(path):
@@ -42,7 +38,6 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
         simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
         model = simple_quantizer.convert_for_runtime()
 
-    # Load weights
     print("📦 Loading weights...")
     checkpoint = torch.load(str(path), mmap=True, weights_only=True)
     if isinstance(checkpoint, dict):
@@ -56,7 +51,6 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
     model.load_state_dict(state_dict, assign=True)
     print("✓ Weights loaded")
 
-    # Move to device
     print(f"🚀 Moving model to {device}...")
     model = model.to(device=device)
     print(f"✓ Model ready!")
@@ -64,37 +58,28 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
     return model
 
 
-def process_single_model(
+def capture_activations_during_generation(
     model: nn.Module,
     sample_input: torch.Tensor,
-    model_type: str,
     save_dir: str,
+    model_type: str,
+    max_new_tokens: int = 50,
     device: str = "cuda",
 ) -> None:
-    """Process a single model and save its activations to disk"""
-    print(f"\n🔄 Processing {model_type} model...")
-
-    # Setup for inference
-    batch_size, seq_length = sample_input.shape[:2]
-    model.eval()
-    model.setup_caches(
-        max_batch_size=batch_size,
-        max_seq_length=seq_length,
-    )
+    """Run generation and capture layer activations"""
 
     activations = {}
     hooks = []
 
     def save_activation(name):
         def hook(module, input, output):
-            # Convert to CPU numpy and save immediately
-            output_np = output.detach().cpu().numpy()
-            save_path = os.path.join(save_dir, f"{model_type}_{name}.npy")
-            np.save(save_path, output_np)
+            if name not in activations:
+                activations[name] = []
+            activations[name].append(output.detach().cpu())
         return hook
 
-    # Register hooks
-    print("📊 Registering hooks...")
+    # Register hooks for all linear layers
+    print(f"\n📊 Registering hooks for {model_type} model...")
     hook_count = 0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -102,32 +87,56 @@ def process_single_model(
             hook_count += 1
     print(f"✓ Registered {hook_count} hooks")
 
-    # Forward pass
-    print(f"🚀 Running {model_type} forward pass...")
+    # Run generation
+    print(f"\n🚀 Running generation with {model_type} model...")
+    batch_size = sample_input.size(0)
+    seq_length = sample_input.size(1)
+
+    model.eval()
+    with torch.device(device):
+        model.setup_caches(
+            max_batch_size=batch_size, max_seq_length=seq_length + max_new_tokens
+        )
+
     with torch.no_grad():
-        try:
-            torch.cuda.empty_cache()
-            print_gpu_memory()
+        input_pos = torch.arange(0, seq_length, device=device)
 
-            input_pos = torch.arange(seq_length, device=device)
-            model(sample_input, input_pos)
+        # First do prefill
+        logits = model(sample_input, input_pos)
 
-            print(f"✓ Forward pass complete")
-            print_gpu_memory()
+        # Then do token-by-token generation
+        current_token = sample_last_token(logits)
+        current_pos = seq_length
 
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                print(
-                    "❌ CUDA out of memory! Try reducing batch size or sequence length"
-                )
-                raise
-            else:
-                raise
+        for i in tqdm(range(max_new_tokens), desc=f"{model_type} generation"):
+            pos = torch.tensor([current_pos], device=device)
+            logits = model(current_token.unsqueeze(0), pos)
+            current_token = sample_last_token(logits)
+            current_pos += 1
+
+    # Save activations
+    print(f"\n💾 Saving {model_type} activations...")
+    for name, acts in activations.items():
+        # Stack all activations for this layer
+        stacked = torch.stack(acts)
+        save_path = os.path.join(save_dir, f"{model_type}_{name}.pt")
+        torch.save(stacked, save_path)
 
     # Clean up
     for hook in hooks:
         hook.remove()
     torch.cuda.empty_cache()
+    print(f"✓ Saved {len(activations)} layer activations")
+
+
+def sample_last_token(logits: torch.Tensor, temperature: float = 0.8, top_k: int = 200):
+    """Sample a token from the logits"""
+    logits = logits[:, -1] / temperature
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float("Inf")
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 def compare_saved_activations(save_dir: str) -> Dict[str, Dict[str, float]]:
@@ -137,34 +146,37 @@ def compare_saved_activations(save_dir: str) -> Dict[str, Dict[str, float]]:
     results = {}
 
     # Get list of saved activation files
-    fp_files = sorted([f for f in os.listdir(save_dir) if f.startswith("fp_")])
+    fp_files = sorted(
+        [f for f in os.listdir(save_dir) if f.startswith("fp_") and f.endswith(".pt")]
+    )
 
     for fp_file in tqdm(fp_files, desc="Analyzing layers"):
-        name = fp_file[3:-4]  # Remove 'fp_' prefix and '.npy' suffix
+        name = fp_file[3:-3]  # Remove 'fp_' prefix and '.pt' suffix
 
         # Load activations
-        fp_activation = np.load(os.path.join(save_dir, fp_file))
-        int8_activation = np.load(os.path.join(save_dir, f"int8_{name}.npy"))
-        int4_activation = np.load(os.path.join(save_dir, f"int4_{name}.npy"))
+        fp_activation = torch.load(os.path.join(save_dir, fp_file))
+        int8_activation = torch.load(os.path.join(save_dir, f"int8_{name}.pt"))
+        int4_activation = torch.load(os.path.join(save_dir, f"int4_{name}.pt"))
 
-        # Convert to torch tensors for calculations
-        fp_tensor = torch.from_numpy(fp_activation)
-        int8_tensor = torch.from_numpy(int8_activation)
-        int4_tensor = torch.from_numpy(int4_activation)
-
-        # Calculate metrics
+        # Calculate metrics (over all generation steps)
         int8_diff = torch.mean(
-            torch.abs(fp_tensor - int8_tensor) / (torch.abs(fp_tensor) + 1e-6)
+            torch.abs(fp_activation - int8_activation)
+            / (torch.abs(fp_activation) + 1e-6)
         )
         int4_diff = torch.mean(
-            torch.abs(fp_tensor - int4_tensor) / (torch.abs(fp_tensor) + 1e-6)
+            torch.abs(fp_activation - int4_activation)
+            / (torch.abs(fp_activation) + 1e-6)
         )
 
-        int8_cos = torch.nn.functional.cosine_similarity(
-            fp_tensor.flatten(), int8_tensor.flatten(), dim=0
+        int8_cos = torch.mean(
+            torch.nn.functional.cosine_similarity(
+                fp_activation.flatten(1), int8_activation.flatten(1), dim=1
+            )
         )
-        int4_cos = torch.nn.functional.cosine_similarity(
-            fp_tensor.flatten(), int4_tensor.flatten(), dim=0
+        int4_cos = torch.mean(
+            torch.nn.functional.cosine_similarity(
+                fp_activation.flatten(1), int4_activation.flatten(1), dim=1
+            )
         )
 
         results[name] = {
@@ -174,16 +186,13 @@ def compare_saved_activations(save_dir: str) -> Dict[str, Dict[str, float]]:
             "int4_cosine_sim": float(int4_cos),
         }
 
-        # Clean up
         del fp_activation, int8_activation, int4_activation
-        del fp_tensor, int8_tensor, int4_tensor
 
         if float(int4_diff) > 0.1:
             print(f"\n⚠️  Significant difference detected in layer {name}:")
             print(f"   INT4 difference: {float(int4_diff)*100:.2f}%")
 
     return results
-
 
 def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
     """Print analysis of layer comparisons"""
@@ -194,7 +203,6 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
     )
     print("-" * 100)
 
-    # Sort by INT4 difference
     sorted_results = dict(
         sorted(results.items(), key=lambda x: x[1]["int4_relative_diff"], reverse=True)
     )
@@ -208,7 +216,6 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
             f"{metrics['int4_cosine_sim']:>11.4f}"
         )
 
-    # Summary statistics
     int8_diffs = [m["int8_relative_diff"] for m in results.values()]
     int4_diffs = [m["int4_relative_diff"] for m in results.values()]
 
@@ -228,7 +235,6 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
         print(f"  INT8: {int8_count} layers ({int8_count/len(int8_diffs)*100:.1f}%)")
         print(f"  INT4: {int4_count} layers ({int4_count/len(int4_diffs)*100:.1f}%)")
 
-
 def main():
     import argparse
 
@@ -237,6 +243,7 @@ def main():
     parser.add_argument("--int8-model", type=str, required=True)
     parser.add_argument("--int4-model", type=str, required=True)
     parser.add_argument("--sample-seq-length", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-dir", type=str, default="activations")
     args = parser.parse_args()
@@ -244,10 +251,8 @@ def main():
     start_time = time.time()
     print("\n🚀 Starting quantization comparison analysis...")
 
-    # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Check CUDA
     if args.device == "cuda" and torch.cuda.is_available():
         print(f"🎯 Using CUDA device: {torch.cuda.get_device_name(0)}")
         print_gpu_memory()
@@ -259,36 +264,31 @@ def main():
     print(f"\n📝 Creating sample input (sequence length: {args.sample_seq_length})...")
     with torch.device("meta"):
         model = Transformer.from_name(Path(args.fp_model).parent.name)
-    sample_input = torch.randn(
-        1,
-        args.sample_seq_length,
-        model.config.dim,
-        device=args.device,
-        dtype=torch.float16,
+    sample_input = torch.randint(
+        0, model.config.vocab_size, (1, args.sample_seq_length), device=args.device
     )
 
-    # Process each model separately
-    print("\n💾 Processing models and saving activations...")
+    print("\n💾 Processing models and capturing generation activations...")
 
-    # FP model
-    model = load_model(args.fp_model, args.device)
-    process_single_model(model, sample_input, "fp", args.save_dir, args.device)
-    del model
-    torch.cuda.empty_cache()
+    # Process each model
+    for model_path, model_type in [
+        (args.fp_model, "fp"),
+        (args.int8_model, "int8"),
+        (args.int4_model, "int4"),
+    ]:
+        model = load_model(model_path, args.device)
+        capture_activations_during_generation(
+            model,
+            sample_input,
+            args.save_dir,
+            model_type,
+            args.max_new_tokens,
+            args.device,
+        )
+        del model
+        torch.cuda.empty_cache()
 
-    # INT8 model
-    model = load_model(args.int8_model, args.device)
-    process_single_model(model, sample_input, "int8", args.save_dir, args.device)
-    del model
-    torch.cuda.empty_cache()
-
-    # INT4 model
-    model = load_model(args.int4_model, args.device)
-    process_single_model(model, sample_input, "int4", args.save_dir, args.device)
-    del model
-    torch.cuda.empty_cache()
-
-    # Compare saved activations
+    # Compare activations
     results = compare_saved_activations(args.save_dir)
 
     # Save results
