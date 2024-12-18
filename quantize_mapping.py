@@ -45,19 +45,15 @@ class EnhancedHybridQuantHandler(QuantHandler):
             self._analyze_layer_characteristics()
 
     def _measure_layer_runtime(self) -> Dict[str, float]:
-        """Measure the runtime of each layer in the model."""
         runtimes = {}
         hooks = []
 
         def timer_hook(name):
+
             def hook(module, input, output):
-                start_time = time.perf_counter()
-                result = module(input[0])
-                end_time = time.perf_counter()
                 if name not in runtimes:
                     runtimes[name] = []
-                runtimes[name].append(end_time - start_time)
-                return result
+                return output  # Just return the output without calling module again
 
             return hook
 
@@ -66,10 +62,15 @@ class EnhancedHybridQuantHandler(QuantHandler):
             if isinstance(module, nn.Linear):
                 hooks.append(module.register_forward_hook(timer_hook(name)))
 
-        # Run multiple forward passes to get stable measurements
+        # Run multiple forward passes with time measurement
         with torch.no_grad():
-            for _ in range(10):  # Multiple runs for stable measurements
+            for _ in range(10):
+                start_times = {name: time.perf_counter() for name in runtimes.keys()}
                 self.model(self.calibration_data, self.input_pos)
+                end_times = {name: time.perf_counter() for name in runtimes.keys()}
+
+                for name in runtimes:
+                    runtimes[name].append(end_times[name] - start_times[name])
 
         # Remove hooks
         for hook in hooks:
