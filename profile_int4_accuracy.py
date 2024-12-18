@@ -6,32 +6,38 @@ import numpy as np
 from tqdm import tqdm
 import time
 from model import Transformer
+from quantize import WeightOnlyInt8QuantHandler, WeightOnlyInt4QuantHandler
 
 
 def load_model(path: str, device: str = "cuda") -> nn.Module:
-    """Load a model and move it to specified device"""
-    print(f"\n📂 Loading model from {path}...")
-    start_time = time.time()
-
-    # First load state dict
-    checkpoint = torch.load(path)
-    print("✓ Checkpoint loaded")
-
     # Create model instance
     print("🔧 Creating model instance...")
-    model_name = Path(path).parent.name
     with torch.device("meta"):
-        model = Transformer.from_name(model_name)
+        model = Transformer.from_name(Path(path).parent.name)
     print("✓ Model architecture created")
+
+    """Load a model and move it to specified device"""
+    print(f"\n📂 Loading model from {path}...")
+
+    if "int8" in str(path):
+        print("Using int8 weight-only quantization!")
+        simple_quantizer = WeightOnlyInt8QuantHandler(model)
+        model = simple_quantizer.convert_for_runtime()
+
+    elif "int4" in str(path):
+        print("Using int4 weight-only quantization!")
+        path_comps = Path(path).name.split(".")
+        groupsize = int(path_comps[-2][1:])
+        simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
+        model = simple_quantizer.convert_for_runtime()
 
     # Load weights
     print("📦 Loading weights...")
+    checkpoint = torch.load(str(path), mmap=True, weights_only=True)
     if isinstance(checkpoint, dict):
         if "model" in checkpoint:
-            # Handle case where state dict is nested under 'model' key
             state_dict = checkpoint["model"]
         else:
-            # Assume the dict is the state dict
             state_dict = checkpoint
     else:
         raise ValueError(f"Unexpected checkpoint type: {type(checkpoint)}")
@@ -42,7 +48,7 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
     # Move to device
     print(f"🚀 Moving model to {device}...")
     model = model.to(device=device)
-    print(f"✓ Model ready! Took {time.time() - start_time:.2f}s")
+    print(f"✓ Model ready!")
 
     return model
 
@@ -55,97 +61,80 @@ def print_gpu_memory():
         print(f"🎯 GPU Memory: {used:.2f}GB used / {total:.2f}GB total")
 
 
+def setup_model_for_inference(model: nn.Module, batch_size: int, seq_length: int):
+    """Setup model caches and masks for inference"""
+    print("🔧 Setting up model for inference...")
+    model.eval()
+    model.setup_caches(
+        max_batch_size=batch_size,
+        max_seq_length=seq_length,
+        dtype=torch.float16,
+        device=model.device,
+    )
+    print("✓ Model caches initialized")
+
+
 def compare_layer_outputs(
     fp_model: nn.Module,
     int8_model: nn.Module,
     int4_model: nn.Module,
     sample_input: torch.Tensor,
     device: str = "cuda",
-    layer_names: List[str] = None,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Compare outputs of each layer across models on specified device.
-    """
+    """Compare outputs of each layer across models"""
     print("\n🔄 Starting layer comparison...")
 
-    # Move models to device
-    print(f"📦 Preparing models on {device}...")
-    fp_model = fp_model.to(device)
-    int8_model = int8_model.to(device)
-    int4_model = int4_model.to(device)
-    sample_input = sample_input.to(device)
-    print_gpu_memory()
-
-    # Set to eval mode
-    print("🔧 Setting models to evaluation mode...")
-    fp_model.eval()
-    int8_model.eval()
-    int4_model.eval()
+    # Setup models for inference
+    batch_size, seq_length = sample_input.shape[:2]
+    for model in [fp_model, int8_model, int4_model]:
+        setup_model_for_inference(model, batch_size, seq_length)
 
     results = {}
-
-    # Register hooks for all linear layers
-    print("\n🎣 Registering hooks for layer tracking...")
     activations = {"fp": {}, "int8": {}, "int4": {}}
     hooks = []
 
     def get_activation(name, model_type):
-
         def hook(module, input, output):
-            activations[model_type][name] = output.detach()
-
+            # Store activation using clone to avoid memory sharing
+            activations[model_type][name] = output.detach().clone()
         return hook
 
-    # Count total linear layers for progress tracking
-    total_layers = sum(
-        1 for _, module in fp_model.named_modules() if isinstance(module, nn.Linear)
-    )
-    print(f"📊 Found {total_layers} linear layers to analyze")
-
-    # Register hooks for each model
-    print("\n⚡ Setting up model hooks...")
+    # Count and register hooks
     hook_count = 0
     for name, module in fp_model.named_modules():
         if isinstance(module, nn.Linear):
-            if layer_names is None or name in layer_names:
-                hooks.append(module.register_forward_hook(get_activation(name, "fp")))
-                hook_count += 1
-    print(f"✓ Registered hooks for FP model: {hook_count} layers")
+            hooks.append(module.register_forward_hook(get_activation(name, "fp")))
+            hook_count += 1
+    print(f"📊 Registered hooks for {hook_count} linear layers")
 
-    hook_count = 0
+    # Register hooks for quantized models
     for name, module in int8_model.named_modules():
         if isinstance(module, nn.Linear):
-            if layer_names is None or name in layer_names:
-                hooks.append(module.register_forward_hook(get_activation(name, "int8")))
-                hook_count += 1
-    print(f"✓ Registered hooks for INT8 model: {hook_count} layers")
+            hooks.append(module.register_forward_hook(get_activation(name, "int8")))
 
-    hook_count = 0
     for name, module in int4_model.named_modules():
         if isinstance(module, nn.Linear):
-            if layer_names is None or name in layer_names:
-                hooks.append(module.register_forward_hook(get_activation(name, "int4")))
-                hook_count += 1
-    print(f"✓ Registered hooks for INT4 model: {hook_count} layers")
+            hooks.append(module.register_forward_hook(get_activation(name, "int4")))
 
     # Forward pass
     print("\n🚀 Running forward passes...")
     with torch.no_grad():
         try:
-            print("Running FP model...")
-            torch.cuda.empty_cache()
-            fp_model(sample_input)
-            print_gpu_memory()
+            for model_type, model in [
+                ("FP", fp_model),
+                ("INT8", int8_model),
+                ("INT4", int4_model),
+            ]:
+                print(f"\nRunning {model_type} model...")
+                torch.cuda.empty_cache()
+                print_gpu_memory()
 
-            print("Running INT8 model...")
-            torch.cuda.empty_cache()
-            int8_model(sample_input)
-            print_gpu_memory()
+                # Create position tensor on the right device
+                input_pos = torch.arange(seq_length, device=device)
+                model(sample_input, input_pos)
 
-            print("Running INT4 model...")
-            torch.cuda.empty_cache()
-            int4_model(sample_input)
-            print_gpu_memory()
+                print(f"✓ {model_type} forward pass complete")
+                print_gpu_memory()
 
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -191,7 +180,7 @@ def compare_layer_outputs(
             print(f"\n⚠️  Significant difference detected in layer {name}:")
             print(f"   INT4 difference: {float(int4_diff.cpu())*100:.2f}%")
 
-    # Clean up hooks and clear cache
+    # Clean up
     print("\n🧹 Cleaning up...")
     for hook in hooks:
         hook.remove()
@@ -210,7 +199,7 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
     )
     print("-" * 100)
 
-    # Sort layers by INT4 difference for better visualization
+    # Sort by INT4 difference
     sorted_results = dict(
         sorted(results.items(), key=lambda x: x[1]["int4_relative_diff"], reverse=True)
     )
@@ -224,7 +213,7 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
             f"{metrics['int4_cosine_sim']:>11.4f}"
         )
 
-    # Calculate summary statistics
+    # Summary statistics
     int8_diffs = [m["int8_relative_diff"] for m in results.values()]
     int4_diffs = [m["int4_relative_diff"] for m in results.values()]
 
@@ -235,7 +224,6 @@ def analyze_and_print_results(results: Dict[str, Dict[str, float]]):
         f"Most Affected Layer: {max(results.items(), key=lambda x: x[1]['int4_relative_diff'])[0]}"
     )
 
-    # Print distribution of differences
     print("\n📊 Distribution of Differences:")
     thresholds = [0.01, 0.05, 0.1, 0.2]
     for thresh in thresholds:
@@ -253,20 +241,19 @@ def main():
     parser.add_argument("--int8-model", type=str, required=True)
     parser.add_argument("--int4-model", type=str, required=True)
     parser.add_argument("--sample-seq-length", type=int, default=512)
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     start_time = time.time()
     print("\n🚀 Starting quantization comparison analysis...")
 
-    # Check CUDA availability if cuda selected
-    if args.device == "cuda":
-        if not torch.cuda.is_available():
-            print("⚠️  CUDA not available, falling back to CPU")
-            args.device = "cpu"
-        else:
-            print(f"🎯 Using CUDA device: {torch.cuda.get_device_name(0)}")
-            print_gpu_memory()
+    # Check CUDA
+    if args.device == "cuda" and torch.cuda.is_available():
+        print(f"🎯 Using CUDA device: {torch.cuda.get_device_name(0)}")
+        print_gpu_memory()
+    else:
+        print("⚠️  CUDA not available, using CPU")
+        args.device = "cpu"
 
     # Load models
     fp_model = load_model(args.fp_model, args.device)
@@ -276,7 +263,11 @@ def main():
     # Create sample input
     print(f"\n📝 Creating sample input (sequence length: {args.sample_seq_length})...")
     sample_input = torch.randn(
-        1, args.sample_seq_length, fp_model.config.hidden_size, device=args.device
+        1,
+        args.sample_seq_length,
+        fp_model.config.hidden_size,
+        device=args.device,
+        dtype=torch.float16,  # Use float16 for efficiency
     )
 
     # Compare models
