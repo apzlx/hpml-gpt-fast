@@ -264,7 +264,7 @@ def main():
     sample_input = torch.randn(
         1,
         args.sample_seq_length,
-        model.config.hidden_size,
+        model.config.dim,
         device=args.device,
         dtype=torch.float16,
     )
