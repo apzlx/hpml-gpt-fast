@@ -9,14 +9,14 @@ import os
 import json
 from model import Transformer
 from quantize import WeightOnlyInt8QuantHandler, WeightOnlyInt4QuantHandler
-
+import torch._dynamo.config
+import torch._inductor.config
 
 def print_gpu_memory():
     if torch.cuda.is_available():
         used = torch.cuda.memory_allocated() / 1024**3
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"🎯 GPU Memory: {used:.2f}GB used / {total:.2f}GB total")
-
 
 def load_model(path: str, device: str = "cuda") -> nn.Module:
     print("🔧 Creating model instance...")
@@ -58,6 +58,44 @@ def load_model(path: str, device: str = "cuda") -> nn.Module:
     return model
 
 
+def setup_cache_padded_seq_input_pos_max_seq_length_for_prefill(
+    model: Transformer,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    max_seq_length: Optional[int] = None,
+):
+    """From eval.py - Sets up model cache and bookkeeping"""
+    T = prompt.size(0)
+    T_new = T + max_new_tokens
+    if max_seq_length is None:
+        max_seq_length = min(T_new, model.config.block_size)
+
+    device, dtype = prompt.device, prompt.dtype
+    empty = torch.empty(T_new, dtype=dtype, device=device)
+    empty[:T] = prompt
+    seq = empty
+    input_pos = torch.arange(0, T, device=device)
+
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+
+    return seq, input_pos, max_seq_length
+
+
+def model_forward(model, x, input_pos):
+    return model(x, input_pos)
+
+
+def sample_last_token(logits: torch.Tensor, temperature: float = 0.8, top_k: int = 200):
+    """Sample a token from the logits"""
+    logits = logits[:, -1] / temperature
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float("Inf")
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)[0]
+
+
 def capture_activations_during_generation(
     model: nn.Module,
     sample_input: torch.Tensor,
@@ -78,7 +116,7 @@ def capture_activations_during_generation(
             activations[name].append(output.detach().cpu())
         return hook
 
-    # Register hooks for all linear layers
+    # Register hooks
     print(f"\n📊 Registering hooks for {model_type} model...")
     hook_count = 0
     for name, module in model.named_modules():
@@ -87,32 +125,50 @@ def capture_activations_during_generation(
             hook_count += 1
     print(f"✓ Registered {hook_count} hooks")
 
-    # Run generation
     print(f"\n🚀 Running generation with {model_type} model...")
-    batch_size = sample_input.size(0)
-    seq_length = sample_input.size(1)
-
     model.eval()
-    with torch.device(device):
-        model.setup_caches(
-            max_batch_size=batch_size, max_seq_length=seq_length + max_new_tokens
+
+    # Set up cache and initial tensors
+    seq, input_pos, max_seq_length = (
+        setup_cache_padded_seq_input_pos_max_seq_length_for_prefill(
+            model, sample_input, max_new_tokens
         )
+    )
 
     with torch.no_grad():
-        input_pos = torch.arange(0, seq_length, device=device)
-        logits = model(sample_input, input_pos)
-        next_token = sample_last_token(logits)
+        try:
+            # Initial forward pass (prefill)
+            x = seq.index_select(0, input_pos).view(1, -1)
+            logits = model_forward(model, x, input_pos)
 
-        cur_token = next_token
-        for i in tqdm(range(max_new_tokens), desc=f"{model_type} generation"):
-            pos = torch.tensor([[seq_length + i]], device=device)
-            logits = model(cur_token.view(1, 1), pos)
-            cur_token = sample_last_token(logits)
+            # Token generation
+            for i in tqdm(range(max_new_tokens), desc=f"{model_type} generation"):
+                next_token = sample_last_token(logits)
+                seq[input_pos.size(0)] = next_token
+
+                # Update input position
+                input_pos = torch.tensor([input_pos.size(0)], device=device)
+
+                # Get next token logits
+                x = seq.index_select(0, input_pos).view(1, -1)
+                logits = model_forward(model, x, input_pos)
+
+                torch.cuda.empty_cache()
+                if i % 10 == 0:
+                    print_gpu_memory()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(
+                    "❌ CUDA out of memory! Try reducing sequence length or max_new_tokens"
+                )
+                raise
+            else:
+                raise
 
     # Save activations
     print(f"\n💾 Saving {model_type} activations...")
     for name, acts in activations.items():
-        # Stack all activations for this layer
         stacked = torch.stack(acts)
         save_path = os.path.join(save_dir, f"{model_type}_{name}.pt")
         torch.save(stacked, save_path)
@@ -124,23 +180,12 @@ def capture_activations_during_generation(
     print(f"✓ Saved {len(activations)} layer activations")
 
 
-def sample_last_token(logits: torch.Tensor, temperature: float = 0.8, top_k: int = 200):
-    """Sample a token from the logits"""
-    logits = logits[:, -1] / temperature
-    if top_k is not None:
-        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-        logits[logits < v[:, [-1]]] = -float("Inf")
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
-
-
 def compare_saved_activations(save_dir: str) -> Dict[str, Dict[str, float]]:
     """Compare activations from saved files"""
     print("\n📊 Comparing saved activations...")
 
     results = {}
 
-    # Get list of saved activation files
     fp_files = sorted(
         [f for f in os.listdir(save_dir) if f.startswith("fp_") and f.endswith(".pt")]
     )
@@ -237,8 +282,8 @@ def main():
     parser.add_argument("--fp-model", type=str, required=True)
     parser.add_argument("--int8-model", type=str, required=True)
     parser.add_argument("--int4-model", type=str, required=True)
-    parser.add_argument("--sample-seq-length", type=int, default=512)
-    parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--sample-seq-length", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-dir", type=str, default="activations")
     args = parser.parse_args()
@@ -251,6 +296,8 @@ def main():
     if args.device == "cuda" and torch.cuda.is_available():
         print(f"🎯 Using CUDA device: {torch.cuda.get_device_name(0)}")
         print_gpu_memory()
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     else:
         print("⚠️  CUDA not available, using CPU")
         args.device = "cpu"
@@ -260,7 +307,7 @@ def main():
     with torch.device("meta"):
         model = Transformer.from_name(Path(args.fp_model).parent.name)
     sample_input = torch.randint(
-        0, model.config.vocab_size, (1, args.sample_seq_length), device=args.device
+        0, model.config.vocab_size, (args.sample_seq_length,), device=args.device
     )
 
     print("\n💾 Processing models and capturing generation activations...")
@@ -282,6 +329,7 @@ def main():
         )
         del model
         torch.cuda.empty_cache()
+        print_gpu_memory()
 
     # Compare activations
     results = compare_saved_activations(args.save_dir)
