@@ -1,10 +1,9 @@
 # Prefill Cache Performance Experiment
 
 ## Setup Instructions
-1. Save each context section below into separate .txt files (context_50.txt, context_100.txt, context_500.txt)
-2. Use the provided test commands for each experiment
-3. Record times from the console output for each run
-4. Run each test 10 times and calculate the average
+1. Use the provided test commands for each experiment
+2. Record times from the console output for each run
+3. Run each test 10 times and calculate the average
 
 ## Test Contexts
 
@@ -74,17 +73,7 @@ python generate.py --compile  --interactive --num_samples 10 --max_new_tokens 20
 # Enter the context + prompt when prompted
 ```
 
-## Data Collection Template
-
-For each experiment, record:
-
-1. Average generation time with prefill cache (10 runs)
-2. Average generation time without prefill cache (10 runs)
-3. Speed improvement percentage
-4. Tokens per second with prefill cache
-5. Tokens per second without prefill cache
-
-### Results Table Template
+### Results Table
 
 | Experiment | Context Length | With Cache (avg) | Without Cache (avg) | Improvement % | Tokens/sec (with) | Tokens/sec (without) | model compilation time |
 |------------|---------------|------------------|--------------------|--------------|--------------------|---------------------|---------------------------|
@@ -95,6 +84,5 @@ For each experiment, record:
 ## Notes
 - Ensure the model is properly loaded before starting measurements
 - Run experiments when system load is low and consistent
-- Record any anomalies or unexpected behavior
 - For the "without cache" runs, concatenate the context and prompt with a space between them
 - Temperature and top_k settings remain constant across all runs
