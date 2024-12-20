@@ -16,7 +16,8 @@ class TorchProfileAnalyzer:
         'gptq': 'GPTQ',
         'sqq': 'SQQ',
         'int8_activation': 'INT8_activation',
-        'hybrid': 'hybrid'
+        'hybrid': 'hybrid',
+        'custom_hybrid': 'custom_hybrid',
     }
 
     def __init__(self):

@@ -32,9 +32,14 @@ python quantize.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --mode hy
 python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model_hybrid_int8_int4.g32.pth --prompt "Hello, my name is"
 ```
 
+### Run Command for Custom Hybrid
+```bash
+python quantize.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --mode hybrid --groupsize 32 --critical_layers \ "layers.0.attention.wo" \ "layers.1.attention.wqkv" \ "layers.1.feed_forward.w2" \ "layers.5.attention.wqkv" \ "layers.5.feed_forward.w2" \ "layers.10.feed_forward.w2" 
+python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model_custom_hybrid_int8_int4.g32.pth --prompt "Hello, my name is" --profile "./profiles/custom_hybrid_profile
+```
 ## Profiler Analysis
 
-### Run Command for INT4
+### Run Command for INT4 and INT8
 ```bash
 python profiler_analysis.py --fp32 ./profiles/fp32_profile.json --quant-methods int8 int4 --profile-dir ./profiles --output-dir ./output
 ```
@@ -256,6 +261,7 @@ We use the EleutherAI evaluation harness to evaluate our model accuracy. To eval
 ```bash
 python eval.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --compile --tasks hellaswag winogrande
 ```
+python eval.py --checkpoint_path checkpoints/meta-llama/Meta-Llama-3-8B/model_custom_hybrid_int8_int4.g32.pth --compile --tasks hellaswag
 
 Note: Generative tasks are currently not supported for gpt-fast
 
