@@ -288,13 +288,28 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
-    if "hybrid" in str(checkpoint_path):
-        print("Using int4, int8 hybrid quantization!")
-        from quantize import HybridQuantHandler
+    if "custom" in str(checkpoint_path):
+        print("Using CUSTOM int4, int8 hybrid quantization!")
+        from hybrid_quantization import HybridQuantHandler
+        critical_layers = {
+            "layers.0.attention.wo",
+            "layers.1.attention.wqkv",
+            "layers.1.feed_forward.w2",
+            "layers.5.attention.wqkv",
+            "layers.5.feed_forward.w2",
+            "layers.10.feed_forward.w2"
+        }
+
+        simple_quantizer = HybridQuantHandler(model, critical_layers=critical_layers)
+        model = simple_quantizer.convert_for_runtime()
+    
+    elif "hybrid" in str(checkpoint_path):
+        print("Using default int4, int8 hybrid quantization!")
+        from hybrid_quantization import HybridQuantHandler
 
         simple_quantizer = HybridQuantHandler(model)
         model = simple_quantizer.convert_for_runtime()
-
+    
     elif "int8-activation" in str(checkpoint_path):
         print("Using int8 weight-activation quantization!")
         from quantize import WeightAndActivationInt8QuantHandler

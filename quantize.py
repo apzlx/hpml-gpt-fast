@@ -6,7 +6,8 @@
 import time
 from pathlib import Path
 
-from hybrid_quantization import HybridQuantHandler
+
+# from quantization_base import QuantHandler 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -614,6 +615,7 @@ def hybrid_quantize(
     label: str = "",
 ) -> None:
     """Quantize a model using hybrid INT8/INT4 quantization."""
+    from hybrid_quantization import HybridQuantHandler
     assert checkpoint_path.is_file(), checkpoint_path
 
     device = "cpu"
@@ -621,7 +623,7 @@ def hybrid_quantize(
 
     print("Loading model...")
     t0 = time.time()
-
+    print(f"critical layers: {critical_layers}")
     try:
         with torch.device("meta"):
             model = Transformer.from_name(checkpoint_path.parent.name)
@@ -643,9 +645,14 @@ def hybrid_quantize(
         # Save quantized model
         dir_name = checkpoint_path.parent
         base_name = checkpoint_path.name
-        new_base_name = base_name.replace(
-            ".pth", f"{label}hybrid_int8_int4.g{int4_groupsize}.pth"
+        if critical_layers is not None:
+            new_base_name = base_name.replace(
+            ".pth", f"{label}custom_hybrid_int8_int4.g{int4_groupsize}.pth"
         )
+        else:
+            new_base_name = base_name.replace(
+                ".pth", f"{label}hybrid_int8_int4.g{int4_groupsize}.pth"
+            )
         quantize_path = dir_name / new_base_name
 
         print(f"Writing quantized weights to {quantize_path}")

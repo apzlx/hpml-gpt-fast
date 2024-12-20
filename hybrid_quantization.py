@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
 
+from quantize import QuantHandler
+from quantize import WeightOnlyInt4Linear, WeightOnlyInt8Linear, _check_linear_int4_k, dynamically_quantize_per_channel, prepare_int4_weight_and_scales_and_zeros
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,7 +22,9 @@ class HybridQuantHandler(QuantHandler):
         self.model = model
         self.int4_groupsize = int4_groupsize
         self.inner_k_tiles = inner_k_tiles
+        print(f"critical layers in hybrid quantization {critical_layers}")
         self.critical_layers = critical_layers or self._get_default_critical_layers()
+        print(f"critical layers after init {critical_layers}")
         self.padding = padding
 
     def _get_default_critical_layers(self) -> Set[str]:
@@ -58,18 +62,25 @@ class HybridQuantHandler(QuantHandler):
 
     def _should_use_int4(self, name: str) -> bool:
         """Determine if a layer should use INT4 quantization."""
-        if any(critical in name for critical in self.critical_layers):
+        # if any(critical in name for critical in self.critical_layers):
+        #     return False
+        # is_int4_candidate = any(
+        #     [
+        #         any(x in name for x in ["mlp.1", "ffn.1", "w2", "w3"]),
+        #         any(x in name for x in ["q_proj", "k_proj", "wq", "wk"]),
+        #         "attention" in name
+        #         and not any(x in name for x in ["0", "output", "wo"]),
+        #         "transformer" in name and not any(x in name for x in ["0", "final"]),
+        #     ]
+        # )
+        # return is_int4_candidate
+
+        name = name.strip()
+        # If the layer is in critical_layers (after stripping whitespace), use INT8
+        if name in {layer.strip() for layer in self.critical_layers}:
             return False
-        is_int4_candidate = any(
-            [
-                any(x in name for x in ["mlp.1", "ffn.1", "w2", "w3"]),
-                any(x in name for x in ["q_proj", "k_proj", "wq", "wk"]),
-                "attention" in name
-                and not any(x in name for x in ["0", "output", "wo"]),
-                "transformer" in name and not any(x in name for x in ["0", "final"]),
-            ]
-        )
-        return is_int4_candidate
+        # Otherwise use INT4
+        return True
 
     @torch.no_grad()
     def create_quantized_state_dict(self, use_cuda=True) -> dict:
@@ -102,9 +113,7 @@ class HybridQuantHandler(QuantHandler):
                         if self.padding:
                             from model import find_multiple
 
-                            print(
-                                f"warning: {name} is padded to satisfy in_features % 1024 == 0"
-                            )
+                            print(f"warning: {name} is padded to satisfy in_features % 1024 == 0")
                             padded_in_features = find_multiple(in_features, 1024)
                             weight = F.pad(
                                 weight, pad=(0, padded_in_features - in_features)
