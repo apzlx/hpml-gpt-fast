@@ -31,7 +31,7 @@ In this magical forest, there lived a special creature that had never been seen 
 ### Experiment 1 (50 token context)
 With prefill cache:
 ```bash
-python generate.py --compile --interactive --prefill_context "$(cat context_50.txt)" --num_samples 10 --max_new_tokens 200 \
+python generate.py --compile --interactive --prefill_context "$(cat ./context/context_50.txt)" --num_samples 10 --max_new_tokens 200 \
 --checkpoint_path checkpoints/$MODEL_REPO/model_int8.pth 
 # Enter the test prompt when prompted
 ```
@@ -47,7 +47,7 @@ python generate.py --compile --interactive --num_samples 10 --max_new_tokens 200
 ### Experiment 2 (100 token context)
 With prefill cache:
 ```bash
-python generate.py --compile  --interactive --prefill_context "$(cat context_100.txt)" --num_samples 10 --max_new_tokens 200 \
+python generate.py --compile  --interactive --prefill_context "$(cat ./context/context_100.txt)" --num_samples 10 --max_new_tokens 200 \
 --checkpoint_path checkpoints/$MODEL_REPO/model_int8.pth
 # Enter the test prompt when prompted
 ```
@@ -62,7 +62,7 @@ python generate.py --compile --interactive --num_samples 10 --max_new_tokens 200
 ### Experiment 3 (500 token context)
 With prefill cache:
 ```bash
-python generate.py --compile --interactive --prefill_context "$(cat context_500.txt)" --num_samples 10 --max_new_tokens 200 \
+python generate.py --compile --interactive --prefill_context "$(cat ./context/context_500.txt)" --num_samples 10 --max_new_tokens 200 \
 --checkpoint_path checkpoints/$MODEL_REPO/model_int8.pth
 # Enter the test prompt when prompted
 ```
@@ -89,8 +89,8 @@ For each experiment, record:
 | Experiment | Context Length | With Cache (avg) | Without Cache (avg) | Improvement % | Tokens/sec (with) | Tokens/sec (without) | model compilation time |
 |------------|---------------|------------------|--------------------|--------------|--------------------|---------------------|---------------------------|
 | 1          | 50           | 6.177            | 6.26               | 1.3          | 32.40              | 31.95               | 28.17
-| 2          | 100          | 6.217            | 6.23               | 2.1          | 32.17              | 32.11               | 30.88 |
-| 3          | 500          | 6.415            | 6.45               |  5.4         | 31.186             | 31.20               | 67.21
+| 2          | 100          | 6.217            | 6.27               | 2.1          | 32.17              | 32.11               | 30.88 |
+| 3          | 500          | 6.415            | 6.45               | 5.4         | 31.186             | 31.20               | 67.21
 
 ## Notes
 - Ensure the model is properly loaded before starting measurements
