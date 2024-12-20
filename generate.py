@@ -165,7 +165,7 @@ def generate(
     T_new = T + max_new_tokens
 
     if interactive:
-        max_seq_length = 350
+        max_seq_length = 1000
     else:
         max_seq_length = min(T_new, model.config.block_size)
 
@@ -288,8 +288,23 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
-    if "hybrid" in str(checkpoint_path):
-        print("Using int4, int8 hybrid quantization!")
+    if "custom" in str(checkpoint_path):
+        print("Using CUSTOM int4, int8 hybrid quantization!")
+        checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+        from quantize import CustomHybridQuantHandler
+        critical_layers = {
+            "layers.0.attention.wo", 
+            "layers.1.attention.wqkv",
+            "layers.1.feed_forward.w2",
+            "layers.5.attention.wqkv",
+            "layers.5.feed_forward.w2",
+            "layers.10.feed_forward.w2"
+        }
+
+        simple_quantizer = CustomHybridQuantHandler(model, critical_layers=critical_layers)
+        model = simple_quantizer.convert_for_runtime()
+    elif "hybrid" in str(checkpoint_path):
+        print("Using DEFAULT int4, int8 hybrid quantization!")
         from quantize import HybridQuantHandler
 
         simple_quantizer = HybridQuantHandler(model)
@@ -439,11 +454,22 @@ def main(
         if i >= 0 and interactive:
             try:
                 prompt = input("Enter your prompt (Ctrl+C to exit): ")
+                if not prompt.strip():
+                    print("Empty prompt, please try again.")
+                    continue
+                
                 if is_chat:
                     prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-                encoded = encode_tokens(
-                    tokenizer, prompt, bos=False, device=device
-                )  # No BOS since context has it
+                try:
+                    encoded = encode_tokens(
+                        tokenizer, prompt, bos=False, device=device
+                    )  # No BOS since context has it
+                    if encoded.numel() == 0:
+                        print("Error: Failed to encode prompt, please try again.")
+                        continue
+                except Exception as e:
+                    print(f"Error encoding prompt: {e}")
+                    continue
             except KeyboardInterrupt:
                 print("\nExiting interactive mode...")
                 break

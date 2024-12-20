@@ -604,7 +604,6 @@ def replace_linear_weight_and_activation_int8(module):
             replace_linear_weight_and_activation_int8(child)
     return module
 
-
 class HybridQuantHandler(QuantHandler):
     def __init__(
         self,
@@ -772,6 +771,140 @@ class HybridQuantHandler(QuantHandler):
         return self.model
 
 
+class CustomHybridQuantHandler(QuantHandler):
+    def __init__(
+        self,
+        model: nn.Module,
+        critical_layers: Set[str],
+        int4_groupsize: int = 32,
+        inner_k_tiles: int = 8,
+        padding: bool = True,
+    ):
+        super().__init__(model)
+        self.model = model
+        self.critical_layers = critical_layers
+        self.int4_groupsize = int4_groupsize
+        self.inner_k_tiles = inner_k_tiles
+        self.padding = padding
+        
+    def _should_use_int8(self, name: str) -> bool:
+        """Determine if a layer should use INT8 quantization."""
+        # print(f"Checking if {name} should use INT8")
+        # print(f"Critical layers: {self.critical_layers}")
+        return any(critical.strip() == name.strip() for critical in self.critical_layers)
+    
+    @torch.no_grad()
+    def create_quantized_state_dict(self, use_cuda=True) -> dict:
+        """Create a state dict with mixed INT4/INT8 quantization."""
+        cur_state_dict = self.model.state_dict()
+        quantized_dict = cur_state_dict.copy()
+        device = "cuda" if use_cuda else "cpu"
+
+        for name, module in self.model.named_modules():
+            
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            print(name,)
+            try:
+                if self._should_use_int8(name):
+                    # Use INT8 quantization for specified critical layers
+                    int8_weight, scales, _ = dynamically_quantize_per_channel(
+                        module.weight.float(), -128, 127, torch.int8
+                    )
+                    quantized_dict[f"{name}.weight"] = int8_weight
+                    quantized_dict[f"{name}.scales"] = scales.to(module.weight.dtype)
+                    print(f"Applied INT8 quantization to critical layer {name}")
+                else:
+                    # Use INT4 quantization for all other layers
+                    out_features = module.out_features
+                    in_features = module.in_features
+                    assert out_features % 8 == 0, "require out_features % 8 == 0"
+                    
+                    weight = module.weight.data
+                    if not _check_linear_int4_k(
+                        in_features, self.int4_groupsize, self.inner_k_tiles
+                    ):
+                        if self.padding:
+                            from model import find_multiple
+                            padded_in_features = find_multiple(in_features, 1024)
+                            weight = F.pad(weight, pad=(0, padded_in_features - in_features))
+                        else:
+                            print(f"warning: {name} skipped, int4 requirements not met")
+                            continue
+
+                    weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
+                        weight.to(torch.bfloat16).to(device=device),
+                        self.int4_groupsize,
+                        self.inner_k_tiles,
+                    )
+                    quantized_dict[f"{name}.weight"] = weight_int4pack
+                    quantized_dict[f"{name}.scales_and_zeros"] = scales_and_zeros
+                    print(f"Applied INT4 quantization to non-critical layer {name}")
+
+            except Exception as e:
+                print(f"Error quantizing layer {name}: {str(e)}")
+                quantized_dict[f"{name}.weight"] = module.weight
+
+        return quantized_dict
+
+    def convert_for_runtime(self) -> nn.Module:
+        """Convert the model for runtime with appropriate linear layers."""
+        # Store original weights
+        original_weights = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                original_weights[name] = {
+                    'weight': module.weight,
+                    'bias': module.bias if module.bias is not None else None
+                }
+        
+        # Replace modules
+        for name, module in self.model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+                
+            # print(f"Processing layer: {name}")
+            parent = self.model
+            # Split the name into parts to traverse the hierarchy
+            parts = name.split('.')
+            # Traverse to the parent module
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+                
+            if self._should_use_int8(name):
+                print(f"Converting {name} to INT8")
+                new_module = WeightOnlyInt8Linear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                )
+            else:
+                # print(f"Converting {name} to INT4")
+                can_use_int4 = _check_linear_int4_k(
+                    module.in_features,
+                    self.int4_groupsize,
+                    self.inner_k_tiles,
+                )
+                if can_use_int4 or self.padding:
+                    new_module = WeightOnlyInt4Linear(
+                        module.in_features,
+                        module.out_features,
+                        bias=False,
+                        groupsize=self.int4_groupsize,
+                        inner_k_tiles=self.inner_k_tiles,
+                        padding=not can_use_int4,
+                    )
+                else:
+                    new_module = WeightOnlyInt8Linear(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                    )
+            
+            # Set the new module
+            setattr(parent, parts[-1], new_module)
+
+        return self.model
 def hybrid_quantize(
     checkpoint_path: Path = Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"),
     int4_groupsize: int = 32,
@@ -781,7 +914,10 @@ def hybrid_quantize(
 ) -> None:
     """Quantize a model using hybrid INT8/INT4 quantization."""
     assert checkpoint_path.is_file(), checkpoint_path
-
+    custom_hybrid = False
+    if critical_layers is not None:
+        custom_hybrid = True
+    
     device = "cpu"
     precision = torch.bfloat16
 
@@ -796,22 +932,36 @@ def hybrid_quantize(
         model.load_state_dict(checkpoint, assign=True)
         model = model.to(dtype=precision, device=device)
 
-        print("Applying hybrid quantization...")
-        handler = HybridQuantHandler(
-            model,
-            int4_groupsize=int4_groupsize,
-            inner_k_tiles=inner_k_tiles,
-            critical_layers=set(critical_layers) if critical_layers else None,
-        )
+        if custom_hybrid:
+            print("Applying CUSTOM hybrid quantization...")
+            handler = CustomHybridQuantHandler(
+                model,
+                int4_groupsize=int4_groupsize,
+                inner_k_tiles=inner_k_tiles,
+                critical_layers=critical_layers,
+            )
+        else: 
+            print("Applying hybrid quantization...")
+            handler = HybridQuantHandler(
+                model,
+                int4_groupsize=int4_groupsize,
+                inner_k_tiles=inner_k_tiles,
+                critical_layers=set(critical_layers) if critical_layers else None,
+            )
 
         quantized_state_dict = handler.create_quantized_state_dict()
 
         # Save quantized model
         dir_name = checkpoint_path.parent
         base_name = checkpoint_path.name
-        new_base_name = base_name.replace(
-            ".pth", f"{label}hybrid_int8_int4.g{int4_groupsize}.pth"
-        )
+        if custom_hybrid:
+            new_base_name = base_name.replace(
+                ".pth", f"{label}custom_hybrid_int8_int4.g{int4_groupsize}.pth"
+            )
+        else:
+            new_base_name = base_name.replace(
+                ".pth", f"{label}hybrid_int8_int4.g{int4_groupsize}.pth"
+            )
         quantize_path = dir_name / new_base_name
 
         print(f"Writing quantized weights to {quantize_path}")
