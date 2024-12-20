@@ -131,7 +131,12 @@ class LayerUpgradeAnalyzer:
         }
 
         print("\nTesting individual layer upgrades...")
-        for layer_name in tqdm(self.layer_names, desc="Analyzing layers"):
+        start_layer = "layers.31.feed_forward.w2"
+        start_index = self.layer_names.index(start_layer)
+        remaining_layers = self.layer_names[start_index:]
+        print(f"remaining layers {remaining_layers}")
+
+        for layer_name in tqdm(remaining_layers, desc="Analyzing layers"):
             model_test = copy.deepcopy(self.model_int4)
             self._swap_layer(model_test, self.model_int8, layer_name)
             model_test = self._prepare_model_for_eval(model_test, max_seq_length)
