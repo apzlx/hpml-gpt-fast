@@ -1,16 +1,0 @@
-nohup: ignoring input
-2024-12-20:11:10:08,180 INFO     [utils.py:162] NumExpr defaulting to 16 threads.
-Loading model ...
-Using CUSTOM int4, int8 hybrid quantization!
-Converting layers.0.attention.wo to INT8
-Converting layers.1.attention.wqkv to INT8
-Converting layers.1.feed_forward.w2 to INT8
-Converting layers.5.attention.wqkv to INT8
-Converting layers.5.feed_forward.w2 to INT8
-Converting layers.10.feed_forward.w2 to INT8
-Time to load model: 3.24 seconds.
-2024-12-20:11:10:14,578 INFO     [huggingface.py:120] Using device 'cuda'
-2024-12-20:11:10:31,427 INFO     [task.py:355] Building contexts for task on rank 0...
-2024-12-20:11:10:42,325 INFO     [task.py:355] Building contexts for task on rank 0...
-2024-12-20:11:10:42,401 INFO     [evaluator.py:319] Running loglikelihood requests
-  0%|          | 0/42702 [00:00<?, ?it/s]
