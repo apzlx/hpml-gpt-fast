@@ -535,7 +535,6 @@ class WeightAndActivationInt8QuantHandler:
         self.mod = mod
 
     @torch.no_grad()
-    def create_quantized_state_dict(self):
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
             if isinstance(mod, torch.nn.Linear):
@@ -654,7 +653,6 @@ class HybridQuantHandler(QuantHandler):
         return critical_layers
 
     def _should_use_int4(self, name: str) -> bool:
-        """Determine if a layer should use INT4 quantization."""
         if any(critical in name for critical in self.critical_layers):
             return False
         is_int4_candidate = any(
@@ -670,7 +668,6 @@ class HybridQuantHandler(QuantHandler):
 
     @torch.no_grad()
     def create_quantized_state_dict(self, use_cuda=True) -> dict:
-        """Create a state dict with mixed INT4/INT8 quantization."""
         cur_state_dict = self.model.state_dict()
         quantized_dict = cur_state_dict.copy()
 
@@ -788,14 +785,12 @@ class CustomHybridQuantHandler(QuantHandler):
         self.padding = padding
         
     def _should_use_int8(self, name: str) -> bool:
-        """Determine if a layer should use INT8 quantization."""
         # print(f"Checking if {name} should use INT8")
         # print(f"Critical layers: {self.critical_layers}")
         return any(critical.strip() == name.strip() for critical in self.critical_layers)
     
     @torch.no_grad()
     def create_quantized_state_dict(self, use_cuda=True) -> dict:
-        """Create a state dict with mixed INT4/INT8 quantization."""
         cur_state_dict = self.model.state_dict()
         quantized_dict = cur_state_dict.copy()
         device = "cuda" if use_cuda else "cpu"
@@ -848,7 +843,6 @@ class CustomHybridQuantHandler(QuantHandler):
         return quantized_dict
 
     def convert_for_runtime(self) -> nn.Module:
-        """Convert the model for runtime with appropriate linear layers."""
         # Store original weights
         original_weights = {}
         for name, module in self.model.named_modules():
@@ -912,7 +906,6 @@ def hybrid_quantize(
     critical_layers: Optional[List[str]] = None,
     label: str = "",
 ) -> None:
-    """Quantize a model using hybrid INT8/INT4 quantization."""
     assert checkpoint_path.is_file(), checkpoint_path
     custom_hybrid = False
     if critical_layers is not None:
