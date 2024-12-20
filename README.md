@@ -1,11 +1,11 @@
 
 # HPML-GPT-Fast
 
+## Project Description
 This repository, [hpml-gpt-fast](https://github.com/apzlx/hpml-gpt-fast), is an enhanced version of the [gpt-fast](https://github.com/pytorch-labs/gpt-fast) provided by PyTorch Labs. Our modifications focus on optimizing performance through various quantization techniques for deep learning models, particularly for running large language models like Meta Llama.
 
 
-## Key Repository Structure
-
+## Repository Outline of Key Components
 ```bash
 ├── README.md                  # Main project documentation
 ├── context                   # Data for prefill cache context
@@ -56,7 +56,7 @@ export MODEL_REPO=meta-llama/Meta-Llama-3-8B
 ./scripts/prepare.sh $MODEL_REPO
 ```
 
-## Usage
+## Example Command to Execute the Code
 
 ### Set Device
 
