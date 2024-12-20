@@ -165,7 +165,7 @@ def generate(
     T_new = T + max_new_tokens
 
     if interactive:
-        max_seq_length = 350
+        max_seq_length = 1000
     else:
         max_seq_length = min(T_new, model.config.block_size)
 
@@ -454,11 +454,22 @@ def main(
         if i >= 0 and interactive:
             try:
                 prompt = input("Enter your prompt (Ctrl+C to exit): ")
+                if not prompt.strip():
+                    print("Empty prompt, please try again.")
+                    continue
+                
                 if is_chat:
                     prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-                encoded = encode_tokens(
-                    tokenizer, prompt, bos=False, device=device
-                )  # No BOS since context has it
+                try:
+                    encoded = encode_tokens(
+                        tokenizer, prompt, bos=False, device=device
+                    )  # No BOS since context has it
+                    if encoded.numel() == 0:
+                        print("Error: Failed to encode prompt, please try again.")
+                        continue
+                except Exception as e:
+                    print(f"Error encoding prompt: {e}")
+                    continue
             except KeyboardInterrupt:
                 print("\nExiting interactive mode...")
                 break
