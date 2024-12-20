@@ -13,7 +13,6 @@ from eval import eval as run_eval
 from tokenizer import get_tokenizer
 
 def get_nested_attr(obj, attr):
-    """Helper function to get nested attribute from a module."""
     attrs = attr.split('.')
     for a in attrs:
         obj = getattr(obj, a)
@@ -33,8 +32,6 @@ class LayerUpgradeAnalyzer:
         self.tokenizer = tokenizer
         self.device = device
         
-        # Default test prompts if none provided (not used directly for metrics now,
-        # but kept for compatibility)
         self.test_prompts = test_prompts or [
             "Explain the theory of relativity in simple terms",
             "Write a story about a detective solving a mysterious case",
@@ -50,18 +47,14 @@ class LayerUpgradeAnalyzer:
         self.results = {}
 
     def _get_linear_layer_names(self) -> List[str]:
-        """Get names of all linear layers in the model."""
         names = []
-        # Include both INT4 and INT8 linear classes or any other classes you want to consider
         linear_classes = (WeightOnlyInt4Linear, WeightOnlyInt8Linear)
-        
         for name, module in self.model_int4.named_modules():
             if isinstance(module, linear_classes):
                 names.append(name)
         return names
 
     def _swap_layer(self, base_model: nn.Module, source_model: nn.Module, layer_name: str) -> None:
-        """Swap a single layer's weights from source model to base model."""
         parent_name, child_name = layer_name.rsplit('.', 1) if '.' in layer_name else ('', layer_name)
         parent = base_model if not parent_name else get_nested_attr(base_model, parent_name)
         source_parent = source_model if not parent_name else get_nested_attr(source_model, parent_name)
@@ -71,11 +64,9 @@ class LayerUpgradeAnalyzer:
         setattr(parent, child_name, copy.deepcopy(source_layer))
 
     def _prepare_model_for_eval(self, model: nn.Module, max_seq_length: int):
-        """Prepare model by setting up caches and moving buffers to correct device."""
         model = model.to(self.device)
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-
-        # Move additional buffers (freqs_cis, causal_mask, kv_cache) to the device
+        
         if hasattr(model, 'freqs_cis') and model.freqs_cis is not None:
             model.freqs_cis = model.freqs_cis.to(self.device)
         if hasattr(model, 'causal_mask') and model.causal_mask is not None:
@@ -90,15 +81,8 @@ class LayerUpgradeAnalyzer:
         return model
 
     def run_lm_eval(self, model: nn.Module, tasks: List[str] = ["hellaswag"], limit: int = 50) -> float:
-        """Run the LM evaluation on specified tasks and return the accuracy."""
-        # We use the provided `eval` function from eval.py directly
-        # limit=50 here as an example, adjust as needed
         eval_results = run_eval(model, self.tokenizer, tasks=tasks, limit=limit)
-        
-        # For HellaSwag, result structure typically includes "results": {"hellaswag": {"acc": ...}}
-        # Adjust if you use different tasks or metrics
         task_name = tasks[0]
-        # print(eval_results)
         accuracy = eval_results["results"][task_name].get("acc_norm,none", 0.0) * 100.0
         print(f"hellaswag[acc_norm]: {accuracy}")
         return accuracy
@@ -108,8 +92,6 @@ class LayerUpgradeAnalyzer:
         print("Evaluating INT4 and INT8 baselines...")
 
         max_seq_length = max(len(self.tokenizer.encode(p)) for p in self.test_prompts) + 100
-
-        # Prepare both models for evaluation
         self.model_int4 = self._prepare_model_for_eval(self.model_int4, max_seq_length)
         self.model_int8 = self._prepare_model_for_eval(self.model_int8, max_seq_length)
         # for name, module in self.model_int4.named_modules():
@@ -164,7 +146,6 @@ class LayerUpgradeAnalyzer:
         self,
         accuracy_threshold: float = 0.5  # Minimum accuracy improvement needed
     ) -> List[Dict]:
-        """Get recommended layers to upgrade based on results."""
         if not self.results:
             raise ValueError("Run analyze_layer_upgrades first")
 
